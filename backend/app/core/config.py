@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     jwt_secret: str
     jwt_expire_minutes: int = 1440
     cors_origins: list[str] = ["http://localhost:5173"]
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-3-5-sonnet-latest"
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -24,4 +26,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

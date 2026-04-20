@@ -19,6 +19,19 @@ Portfolio-ready full-stack starter for an AI-powered job application tracker.
 - Job detail workspace shell
 - Architecture ready for AI analysis, chat, reminders, and answer generation
 
+## Current product state
+
+- Stage 1: tracker, auth, saved/applied workflow
+- Stage 2: candidate profile and structured fit analysis
+- Stage 3: per-job workspace, chat history, and structured metadata updates
+- Stage 4 backend foundation: `/api/ai/parse`, `/api/ai/analyze`, `/api/ai/chat`
+
+The new AI endpoints support:
+
+- fallback mode with deterministic local logic when no API key is configured
+- optional Claude integration when `ANTHROPIC_API_KEY` is present in the backend environment
+- backend-owned parsing, analysis, and job-scoped chat so the frontend never exposes provider keys
+
 ## Project structure
 
 ```text
@@ -30,7 +43,7 @@ backend/    FastAPI app
 
 1. Create a PostgreSQL database.
 2. Copy `backend/.env.example` to `backend/.env`.
-3. Update `DATABASE_URL` and `JWT_SECRET`.
+3. Update `DATABASE_URL`, `JWT_SECRET`, and optionally `ANTHROPIC_API_KEY`.
 4. Use Python `3.13` for the backend virtual environment.
 5. Install dependencies:
 
@@ -56,8 +69,18 @@ npm run dev
 
 Frontend runs on `http://localhost:5173`.
 
-## Next stages
+## Real AI path
 
-- Stage 2: AI job analysis against user profile
-- Stage 3: Per-job chat workspace and structured metadata editing
-- Stage 4: Follow-ups, generators, and smart insights
+When you are ready for live AI behavior:
+
+1. Set `ANTHROPIC_API_KEY` in `backend/.env`
+2. Run the backend with Python `3.13`
+3. Switch the frontend from demo-only logic to the Stage 4 backend endpoints
+
+Target workflow:
+
+- paste a job link
+- parse and extract fields on the backend
+- analyze against the candidate profile
+- fill the job workspace automatically
+- continue inside the job-scoped assistant chat

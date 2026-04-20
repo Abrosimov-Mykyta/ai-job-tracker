@@ -1,4 +1,4 @@
-import type { AuthResponse, Job } from "../types";
+import type { AuthResponse, Job, JobMessage, JobMetadata, UserProfile } from "../types";
 
 const API_BASE_URL = "http://localhost:8000/api";
 
@@ -65,3 +65,41 @@ export function deleteJob(token: string, jobId: number): Promise<void> {
   return request<void>(`/jobs/${jobId}`, { method: "DELETE", token });
 }
 
+export function parseJobWithAi(
+  token: string,
+  payload: { job_url: string; job_html?: string }
+): Promise<{
+  company: string;
+  title: string;
+  link: string;
+  job_description: string;
+  extracted_requirements: string[];
+  metadata: JobMetadata;
+  parser_mode: "fallback" | "llm";
+}> {
+  return request("/ai/parse", { method: "POST", token, body: payload });
+}
+
+export function analyzeJobWithAi(
+  token: string,
+  payload: { profile: UserProfile; workspace: Job }
+): Promise<{
+  analysis: Job["analysis"];
+  metadata: JobMetadata | null;
+  provider_mode: "fallback" | "llm";
+}> {
+  return request("/ai/analyze", { method: "POST", token, body: payload });
+}
+
+export function chatJobWithAi(
+  token: string,
+  payload: { profile: UserProfile; workspace: Job; message: string }
+): Promise<{
+  assistant_message: JobMessage;
+  metadata_patch: JobMetadata | null;
+  notes_append: string | null;
+  status_patch: Job["status"] | null;
+  provider_mode: "fallback" | "llm";
+}> {
+  return request("/ai/chat", { method: "POST", token, body: payload });
+}
