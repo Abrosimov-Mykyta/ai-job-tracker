@@ -1,4 +1,12 @@
-import { FormEvent, type Dispatch, type ReactNode, type SetStateAction, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useEffect,
+  useMemo,
+  useState
+} from "react";
 import {
   Navigate,
   NavLink,
@@ -16,10 +24,22 @@ import {
   register,
   updateJob
 } from "./lib/api";
-import type { AuthFormMode, AuthResponse, Job, JobStatus, User } from "./types";
+import type {
+  AuthFormMode,
+  AuthResponse,
+  Job,
+  JobAnalysis,
+  JobStatus,
+  Recommendation,
+  User,
+  UserProfile
+} from "./types";
 
 const TOKEN_KEY = "ai-job-tracker-token";
 const USER_KEY = "ai-job-tracker-user";
+const DEMO_JOBS_KEY = "ai-job-tracker-demo-jobs";
+const DEMO_PROFILE_KEY = "ai-job-tracker-demo-profile";
+const DEMO_TOKEN = "demo-token";
 
 const initialJobForm = {
   company: "",
@@ -39,14 +59,19 @@ type DashboardPageProps = {
   jobs: Job[];
   savedJobs: Job[];
   appliedJobs: Job[];
+  profile: UserProfile;
   formState: typeof initialJobForm;
   setFormState: Dispatch<SetStateAction<typeof initialJobForm>>;
   onCreateJob: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  onSaveProfile: (event: FormEvent<HTMLFormElement>) => void;
 };
 
 type JobPageProps = {
   jobs: Job[];
   jobError: string;
+  analysisBusy: boolean;
+  profile: UserProfile;
+  onAnalyzeJob: (job: Job) => Promise<void>;
   onDeleteJob: (jobId: number) => Promise<void>;
   onStatusChange: (job: Job, status: JobStatus) => Promise<void>;
   onSaveJob: (jobId: number, payload: Partial<JobEditableFields>) => Promise<void>;
@@ -63,6 +88,190 @@ type AppShellProps = {
 
 type JobEditableFields = Pick<Job, "company" | "title" | "link" | "notes">;
 
+const demoUser: User = {
+  id: 1,
+  full_name: "Mykyta Demo",
+  email: "demo@ai-job-tracker.local"
+};
+
+const demoProfileSeed: UserProfile = {
+  preferred_roles: ["Frontend Engineer", "Full-Stack Engineer", "Product Engineer"],
+  tech_stack: ["React", "TypeScript", "FastAPI", "PostgreSQL", "Tailwind CSS"],
+  skills: [
+    { name: "React", level: "advanced", years: 3 },
+    { name: "TypeScript", level: "advanced", years: 2 },
+    { name: "JavaScript", level: "advanced", years: 4 },
+    { name: "Python", level: "intermediate", years: 2 },
+    { name: "FastAPI", level: "intermediate", years: 1 },
+    { name: "PostgreSQL", level: "intermediate", years: 1 }
+  ],
+  years_of_experience: 3,
+  english_level: "B2",
+  location: "Europe",
+  work_format: "remote"
+};
+
+const demoJobsSeed: Job[] = [
+  {
+    id: 101,
+    company: "Stripe",
+    title: "Frontend Engineer",
+    link: "https://jobs.stripe.com/frontend-engineer",
+    status: "applied",
+    notes: "Strong React fit. Recruiter reached out last week. Good portfolio match.",
+    job_description:
+      "Build polished React and TypeScript product experiences. Collaborate with product and design. Improve frontend architecture and performance.",
+    extracted_requirements: ["React", "TypeScript", "Frontend Architecture", "Product Thinking"],
+    analysis: {
+      match_score: 88,
+      strengths: ["Strong React experience", "Solid TypeScript background", "Product-oriented frontend fit"],
+      missing_skills: ["None critical"],
+      seniority_fit: "good fit",
+      recommendation: "apply",
+      summary: "This role aligns well with your strongest frontend skills and portfolio direction."
+    },
+    created_at: "2026-04-18T09:00:00.000Z",
+    updated_at: "2026-04-19T14:30:00.000Z"
+  },
+  {
+    id: 102,
+    company: "Linear",
+    title: "Product Engineer",
+    link: "https://linear.app/careers/product-engineer",
+    status: "saved",
+    notes: "Great product culture. Need to review TypeScript depth and product-thinking angle.",
+    job_description:
+      "Own full product slices across React, TypeScript, API integrations, and UX polish. Work closely with product and design in a fast-moving team.",
+    extracted_requirements: ["React", "TypeScript", "API Integrations", "UX Polish", "Product Thinking"],
+    analysis: null,
+    created_at: "2026-04-19T11:15:00.000Z",
+    updated_at: "2026-04-19T11:15:00.000Z"
+  },
+  {
+    id: 103,
+    company: "Remote",
+    title: "Full-Stack Developer",
+    link: "https://remote.com/careers/full-stack-developer",
+    status: "saved",
+    notes: "Interesting because of remote-first setup and strong React/FastAPI overlap.",
+    job_description:
+      "Ship full-stack features using React, Python APIs, PostgreSQL, and cloud tooling. Comfortable across product delivery and backend fundamentals.",
+    extracted_requirements: ["React", "Python", "APIs", "PostgreSQL", "Cloud Tooling"],
+    analysis: null,
+    created_at: "2026-04-20T08:20:00.000Z",
+    updated_at: "2026-04-20T08:20:00.000Z"
+  }
+];
+
+function isDemoSession(token: string | null): boolean {
+  return token === DEMO_TOKEN;
+}
+
+function getDemoJobs(): Job[] {
+  const stored = localStorage.getItem(DEMO_JOBS_KEY);
+  if (stored) {
+    return JSON.parse(stored) as Job[];
+  }
+  localStorage.setItem(DEMO_JOBS_KEY, JSON.stringify(demoJobsSeed));
+  return demoJobsSeed;
+}
+
+function saveDemoJobs(jobs: Job[]) {
+  localStorage.setItem(DEMO_JOBS_KEY, JSON.stringify(jobs));
+}
+
+function getDemoProfile(): UserProfile {
+  const stored = localStorage.getItem(DEMO_PROFILE_KEY);
+  if (stored) {
+    return JSON.parse(stored) as UserProfile;
+  }
+  localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(demoProfileSeed));
+  return demoProfileSeed;
+}
+
+function saveDemoProfile(profile: UserProfile) {
+  localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(profile));
+}
+
+function normalizeToken(input: string): string {
+  return input.trim().toLowerCase();
+}
+
+function inferRequirements(job: Job): string[] {
+  if (job.extracted_requirements?.length) {
+    return job.extracted_requirements;
+  }
+
+  const combined = `${job.title} ${job.notes} ${job.job_description ?? ""}`;
+  const keywordMap = [
+    "React",
+    "TypeScript",
+    "JavaScript",
+    "Python",
+    "FastAPI",
+    "PostgreSQL",
+    "APIs",
+    "Frontend Architecture",
+    "Product Thinking",
+    "UX Polish",
+    "Cloud Tooling"
+  ];
+
+  const detected = keywordMap.filter((item) =>
+    combined.toLowerCase().includes(item.toLowerCase())
+  );
+
+  return detected.length ? detected : ["Communication", "Product Thinking", "Execution"];
+}
+
+function analyzeJobAgainstProfile(job: Job, profile: UserProfile): JobAnalysis {
+  const requirements = inferRequirements(job);
+  const userSkillNames = new Set(profile.skills.map((skill) => normalizeToken(skill.name)));
+  const techStack = new Set(profile.tech_stack.map((item) => normalizeToken(item)));
+  const matched = requirements.filter((item) => {
+    const token = normalizeToken(item);
+    return userSkillNames.has(token) || techStack.has(token);
+  });
+  const missing = requirements.filter((item) => !matched.includes(item));
+
+  const strongRoleFit = profile.preferred_roles.some((role) =>
+    normalizeToken(job.title).includes(normalizeToken(role.split(" ")[0]))
+  );
+
+  let score = 48;
+  score += matched.length * 10;
+  score += strongRoleFit ? 8 : 0;
+  score += Math.min(profile.years_of_experience * 3, 12);
+  score -= missing.length * 6;
+  score = Math.max(22, Math.min(96, score));
+
+  const seniorityFit: JobAnalysis["seniority_fit"] =
+    profile.years_of_experience <= 1 && /senior|lead/i.test(job.title)
+      ? "too junior"
+      : profile.years_of_experience >= 6 && /junior|intern/i.test(job.title)
+        ? "too senior"
+        : "good fit";
+
+  const recommendation: Recommendation =
+    score >= 75 ? "apply" : score >= 55 ? "consider" : "skip";
+
+  return {
+    match_score: score,
+    strengths: matched.length
+      ? matched.map((item) => `Matches ${item}`)
+      : ["Transferable product and engineering foundation"],
+    missing_skills: missing.length ? missing : ["No obvious critical gaps"],
+    seniority_fit: seniorityFit,
+    recommendation,
+    summary:
+      recommendation === "apply"
+        ? "Strong overlap between this role and your current profile. Worth pursuing."
+        : recommendation === "consider"
+          ? "There is real potential here, but review the gaps before investing time."
+          : "This role looks weaker against your current profile and may not be the best target."
+  };
+}
+
 function App() {
   const [authMode, setAuthMode] = useState<AuthFormMode>("register");
   const [session, setSession] = useState<SessionState>(() => {
@@ -74,9 +283,11 @@ function App() {
     };
   });
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [profile, setProfile] = useState<UserProfile>(getDemoProfile);
   const [authError, setAuthError] = useState("");
   const [jobError, setJobError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [analysisBusyId, setAnalysisBusyId] = useState<number | null>(null);
   const [formState, setFormState] = useState(initialJobForm);
 
   const savedJobs = useMemo(() => jobs.filter((job) => job.status === "saved"), [jobs]);
@@ -94,6 +305,11 @@ function App() {
     try {
       setLoading(true);
       setJobError("");
+      if (isDemoSession(nextToken)) {
+        setJobs(getDemoJobs());
+        setProfile(getDemoProfile());
+        return;
+      }
       const items = await fetchJobs(nextToken);
       setJobs(items);
     } catch (error) {
@@ -142,6 +358,39 @@ function App() {
 
     try {
       setJobError("");
+      if (isDemoSession(session.token)) {
+        const now = new Date().toISOString();
+        const createdJob: Job = {
+          id: Date.now(),
+          company: formState.company,
+          title: formState.title,
+          link: formState.link,
+          notes: formState.notes,
+          status: "saved",
+          job_description: formState.notes,
+          extracted_requirements: inferRequirements({
+            id: 0,
+            company: formState.company,
+            title: formState.title,
+            link: formState.link,
+            notes: formState.notes,
+            status: "saved",
+            created_at: now,
+            updated_at: now
+          }),
+          analysis: null,
+          created_at: now,
+          updated_at: now
+        };
+        setJobs((currentJobs) => {
+          const nextJobs = [createdJob, ...currentJobs];
+          saveDemoJobs(nextJobs);
+          return nextJobs;
+        });
+        setFormState(initialJobForm);
+        return;
+      }
+
       const createdJob = await createJob(session.token, formState);
       setJobs((currentJobs) => [createdJob, ...currentJobs]);
       setFormState(initialJobForm);
@@ -157,6 +406,16 @@ function App() {
 
     try {
       setJobError("");
+      if (isDemoSession(session.token)) {
+        setJobs((currentJobs) => {
+          const nextJobs = currentJobs.map((item) =>
+            item.id === job.id ? { ...item, status, updated_at: new Date().toISOString() } : item
+          );
+          saveDemoJobs(nextJobs);
+          return nextJobs;
+        });
+        return;
+      }
       const updated = await updateJob(session.token, job.id, { status });
       setJobs((currentJobs) =>
         currentJobs.map((item) => (item.id === updated.id ? updated : item))
@@ -173,6 +432,28 @@ function App() {
 
     try {
       setJobError("");
+      if (isDemoSession(session.token)) {
+        setJobs((currentJobs) => {
+          const nextJobs = currentJobs.map((item) =>
+            item.id === jobId
+              ? {
+                  ...item,
+                  ...payload,
+                  job_description: payload.notes ?? item.job_description,
+                  extracted_requirements: inferRequirements({
+                    ...item,
+                    ...payload,
+                    job_description: payload.notes ?? item.job_description
+                  }),
+                  updated_at: new Date().toISOString()
+                }
+              : item
+          );
+          saveDemoJobs(nextJobs);
+          return nextJobs;
+        });
+        return;
+      }
       const updated = await updateJob(session.token, jobId, payload);
       setJobs((currentJobs) =>
         currentJobs.map((item) => (item.id === updated.id ? updated : item))
@@ -189,6 +470,14 @@ function App() {
 
     try {
       setJobError("");
+      if (isDemoSession(session.token)) {
+        setJobs((currentJobs) => {
+          const nextJobs = currentJobs.filter((job) => job.id !== jobId);
+          saveDemoJobs(nextJobs);
+          return nextJobs;
+        });
+        return;
+      }
       await deleteJob(session.token, jobId);
       setJobs((currentJobs) => currentJobs.filter((job) => job.id !== jobId));
     } catch (error) {
@@ -196,11 +485,83 @@ function App() {
     }
   }
 
+  async function handleAnalyzeJob(job: Job) {
+    setAnalysisBusyId(job.id);
+
+    try {
+      if (session.token && isDemoSession(session.token)) {
+        const analysis = analyzeJobAgainstProfile(job, profile);
+        setJobs((currentJobs) => {
+          const nextJobs = currentJobs.map((item) =>
+            item.id === job.id
+              ? {
+                  ...item,
+                  analysis,
+                  extracted_requirements: inferRequirements(item),
+                  updated_at: new Date().toISOString()
+                }
+              : item
+          );
+          saveDemoJobs(nextJobs);
+          return nextJobs;
+        });
+      }
+    } finally {
+      setAnalysisBusyId(null);
+    }
+  }
+
+  function handleSaveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const nextProfile: UserProfile = {
+      preferred_roles: String(formData.get("preferred_roles") ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+      tech_stack: String(formData.get("tech_stack") ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+      years_of_experience: Number(formData.get("years_of_experience") ?? 0),
+      english_level: String(formData.get("english_level") ?? "B2"),
+      location: String(formData.get("location") ?? "Europe"),
+      work_format: String(formData.get("work_format") ?? "remote") as UserProfile["work_format"],
+      skills: String(formData.get("skills") ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((name) => {
+          const existing = profile.skills.find(
+            (skill) => normalizeToken(skill.name) === normalizeToken(name)
+          );
+          return existing ?? { name, level: "intermediate", years: 1 };
+        })
+    };
+
+    setProfile(nextProfile);
+    saveDemoProfile(nextProfile);
+  }
+
   function logout() {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
     setSession({ token: null, user: null });
     setJobs([]);
+  }
+
+  function enterDemoMode() {
+    const nextSession = {
+      token: DEMO_TOKEN,
+      user: demoUser
+    };
+    saveDemoJobs(getDemoJobs());
+    saveDemoProfile(getDemoProfile());
+    setSession(nextSession);
+    setProfile(getDemoProfile());
+    localStorage.setItem(TOKEN_KEY, DEMO_TOKEN);
+    localStorage.setItem(USER_KEY, JSON.stringify(demoUser));
+    setAuthError("");
   }
 
   const isAuthenticated = Boolean(session.token && session.user);
@@ -217,6 +578,7 @@ function App() {
               <AuthPage
                 authError={authError}
                 authMode={authMode}
+                onEnterDemoMode={enterDemoMode}
                 onAuthSubmit={handleAuthSubmit}
                 setAuthMode={setAuthMode}
               />
@@ -241,6 +603,8 @@ function App() {
                   jobs={jobs}
                   loading={loading}
                   onCreateJob={handleCreateJob}
+                  onSaveProfile={handleSaveProfile}
+                  profile={profile}
                   savedJobs={savedJobs}
                   setFormState={setFormState}
                 />
@@ -262,11 +626,14 @@ function App() {
                 userName={session.user.full_name}
               >
                 <JobPage
+                  analysisBusy={analysisBusyId !== null}
                   jobError={jobError}
                   jobs={jobs}
+                  onAnalyzeJob={handleAnalyzeJob}
                   onDeleteJob={handleDeleteJob}
                   onSaveJob={handleSaveJob}
                   onStatusChange={handleStatusChange}
+                  profile={profile}
                 />
               </AppShell>
             ) : (
@@ -286,11 +653,13 @@ function App() {
 function AuthPage({
   authMode,
   authError,
+  onEnterDemoMode,
   onAuthSubmit,
   setAuthMode
 }: {
   authMode: AuthFormMode;
   authError: string;
+  onEnterDemoMode: () => void;
   onAuthSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void>;
   setAuthMode: (mode: AuthFormMode) => void;
 }) {
@@ -300,8 +669,8 @@ function AuthPage({
         <p className="eyebrow">Portfolio Project</p>
         <h1>AI-powered job tracker with a real product shape from day one.</h1>
         <p className="hero-copy">
-          Stage 1 now includes auth, dashboard navigation, separate job pages, manual tracking,
-          and a structured workspace that is ready to grow into AI analysis and chat.
+          Stage 2 now adds profile-driven job analysis with structured match score, strengths,
+          missing skills, and clear apply or skip guidance.
         </p>
         <div className="hero-grid">
           <article>
@@ -309,16 +678,16 @@ function AuthPage({
             <strong>Auth, dashboard, saved/applied flows</strong>
           </article>
           <article>
-            <span>Workspace</span>
-            <strong>Dedicated page for every tracked job</strong>
+            <span>AI analysis</span>
+            <strong>Structured scoring from profile to role fit</strong>
           </article>
           <article>
             <span>Backend</span>
-            <strong>JWT auth plus CRUD API for jobs</strong>
+            <strong>Frontend remains ready for future analysis APIs</strong>
           </article>
           <article>
             <span>Next</span>
-            <strong>AI scoring, profile fit, and per-job assistant</strong>
+            <strong>Per-job chat and structured application workspace</strong>
           </article>
         </div>
       </section>
@@ -358,9 +727,14 @@ function AuthPage({
             <input name="password" placeholder="Minimum 8 characters" required type="password" />
           </label>
           {authError ? <p className="error-text">{authError}</p> : null}
-          <button className="primary-button" type="submit">
-            {authMode === "register" ? "Create account" : "Sign in"}
-          </button>
+          <div className="auth-actions">
+            <button className="primary-button" type="submit">
+              {authMode === "register" ? "Create account" : "Sign in"}
+            </button>
+            <button className="secondary-button" onClick={onEnterDemoMode} type="button">
+              Try demo mode
+            </button>
+          </div>
         </form>
       </section>
     </main>
@@ -456,6 +830,8 @@ function DashboardPage({
   jobs,
   loading,
   onCreateJob,
+  onSaveProfile,
+  profile,
   savedJobs,
   setFormState
 }: DashboardPageProps) {
@@ -466,8 +842,8 @@ function DashboardPage({
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">Stage 1 complete</p>
-          <h1>Track your job search in a structured workspace</h1>
+          <p className="eyebrow">Stage 2 active</p>
+          <h1>Track your job search and score roles against your profile</h1>
         </div>
         <div className="topbar-metrics">
           <article>
@@ -530,14 +906,14 @@ function DashboardPage({
               />
             </label>
             <label>
-              Notes
+              Job description or notes
               <textarea
                 value={formState.notes}
                 onChange={(event) =>
                   setFormState((current) => ({ ...current, notes: event.target.value }))
                 }
-                placeholder="Why this role matters, salary hints, recruiter details..."
-                rows={4}
+                placeholder="Paste requirements, salary hints, recruiter context, or why the role matters..."
+                rows={5}
               />
             </label>
             {jobError ? <p className="error-text">{jobError}</p> : null}
@@ -550,17 +926,68 @@ function DashboardPage({
         <article className="panel panel-accent">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Tracker status</p>
-              <h2>What this MVP already covers</h2>
+              <p className="eyebrow">AI profile</p>
+              <h2>What analysis uses</h2>
             </div>
           </div>
-          <ul className="feature-list">
-            <li>Authentication and personal workspace entry point</li>
-            <li>Saved and applied job tracking with status transitions</li>
-            <li>Dedicated detail page for every opportunity</li>
-            <li>Manual notes for recruiters, salary hints, and follow-up context</li>
-            <li>Backend API ready for profile, AI analysis, and reminders</li>
-          </ul>
+          <form className="job-form" onSubmit={onSaveProfile}>
+            <label>
+              Preferred roles
+              <input
+                defaultValue={profile.preferred_roles.join(", ")}
+                name="preferred_roles"
+                placeholder="Frontend Engineer, Full-Stack Engineer"
+              />
+            </label>
+            <label>
+              Tech stack
+              <input
+                defaultValue={profile.tech_stack.join(", ")}
+                name="tech_stack"
+                placeholder="React, TypeScript, FastAPI"
+              />
+            </label>
+            <label>
+              Skills
+              <textarea
+                defaultValue={profile.skills.map((skill) => skill.name).join(", ")}
+                name="skills"
+                rows={4}
+              />
+            </label>
+            <div className="two-column-grid">
+              <label>
+                Years of experience
+                <input
+                  defaultValue={profile.years_of_experience}
+                  min="0"
+                  name="years_of_experience"
+                  type="number"
+                />
+              </label>
+              <label>
+                English level
+                <input defaultValue={profile.english_level} name="english_level" />
+              </label>
+            </div>
+            <div className="two-column-grid">
+              <label>
+                Location
+                <input defaultValue={profile.location} name="location" />
+              </label>
+              <label>
+                Work format
+                <select defaultValue={profile.work_format} name="work_format">
+                  <option value="remote">Remote</option>
+                  <option value="hybrid">Hybrid</option>
+                  <option value="office">Office</option>
+                </select>
+              </label>
+            </div>
+            <button className="secondary-button" type="submit">
+              Save profile
+            </button>
+          </form>
         </article>
       </section>
 
@@ -608,32 +1035,32 @@ function DashboardPage({
         <article className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Upcoming AI</p>
-              <h2>Evaluation panel</h2>
+              <p className="eyebrow">Why Stage 2 matters</p>
+              <h2>Structured AI output</h2>
             </div>
           </div>
-          <div className="ai-placeholder">
-            <div className="score-ring">
-              <strong>--</strong>
-              <span>Match</span>
-            </div>
-            <div>
-              <p className="muted-text">
-                Stage 2 will analyze job requirements against your profile and add strengths,
-                skill gaps, and a clear recommendation here.
-              </p>
-              <button className="secondary-button" disabled type="button">
-                Analyze job with AI
-              </button>
-            </div>
-          </div>
+          <ul className="feature-list">
+            <li>Profile becomes the source of truth for evaluating roles</li>
+            <li>Every job can produce a clear match score and recommendation</li>
+            <li>No wall-of-text output, only structured decision support</li>
+            <li>This is the bridge from tracker to real AI product behavior</li>
+          </ul>
         </article>
       </section>
     </>
   );
 }
 
-function JobPage({ jobError, jobs, onDeleteJob, onSaveJob, onStatusChange }: JobPageProps) {
+function JobPage({
+  analysisBusy,
+  jobError,
+  jobs,
+  onAnalyzeJob,
+  onDeleteJob,
+  onSaveJob,
+  onStatusChange,
+  profile
+}: JobPageProps) {
   const params = useParams<{ jobId: string }>();
   const navigate = useNavigate();
   const jobId = Number(params.jobId);
@@ -758,7 +1185,7 @@ function JobPage({ jobError, jobs, onDeleteJob, onSaveJob, onStatusChange }: Job
                 />
               </label>
               <label>
-                Notes
+                Job description or notes
                 <textarea
                   rows={7}
                   value={editState.notes}
@@ -802,8 +1229,18 @@ function JobPage({ jobError, jobs, onDeleteJob, onSaveJob, onStatusChange }: Job
                 </a>
               </div>
               <div className="detail-column">
-                <span>Notes</span>
+                <span>Description / notes</span>
                 <p>{currentJob.notes || "No notes yet."}</p>
+              </div>
+              <div className="detail-column">
+                <span>Detected requirements</span>
+                <div className="tag-row">
+                  {inferRequirements(currentJob).map((item) => (
+                    <span key={item} className="tag">
+                      {item}
+                    </span>
+                  ))}
+                </div>
               </div>
               {jobError ? <p className="error-text">{jobError}</p> : null}
               <div className="job-actions">
@@ -818,34 +1255,70 @@ function JobPage({ jobError, jobs, onDeleteJob, onSaveJob, onStatusChange }: Job
         <article className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Workspace status</p>
-              <h2>Stage 1 snapshot</h2>
+              <p className="eyebrow">AI evaluation</p>
+              <h2>Profile-based job analysis</h2>
             </div>
           </div>
-          <div className="detail-stack">
-            <div className="detail-row">
-              <span>Status</span>
-              <strong>
-                {currentJob.status === "applied"
-                  ? "Application sent"
-                  : "Still under review"}
-              </strong>
+          <div className="analysis-panel">
+            <div className="score-ring score-ring-active">
+              <strong>{currentJob.analysis ? `${currentJob.analysis.match_score}%` : "--"}</strong>
+              <span>Match</span>
             </div>
-            <div className="detail-row">
-              <span>Next step</span>
-              <strong>
-                {currentJob.status === "applied"
-                  ? "Prepare follow-up workflow in Stage 3"
-                  : "Review and decide whether to apply"}
-              </strong>
-            </div>
-            <div className="detail-column">
-              <span>Why this page matters</span>
+            <div className="analysis-content">
+              <div className="detail-row">
+                <span>Recommendation</span>
+                <strong className={`recommendation-pill ${currentJob.analysis?.recommendation ?? "consider"}`}>
+                  {currentJob.analysis?.recommendation ?? "not analyzed"}
+                </strong>
+              </div>
+              <div className="detail-row">
+                <span>Seniority fit</span>
+                <strong>{currentJob.analysis?.seniority_fit ?? "unknown"}</strong>
+              </div>
               <p className="muted-text">
-                This dedicated job page becomes the foundation for AI chat, recruiter tracking,
-                follow-up dates, and generated answers in later stages.
+                {currentJob.analysis?.summary ??
+                  "Run AI analysis to compare this role against your current profile."}
               </p>
+              <button
+                className="primary-button"
+                disabled={analysisBusy}
+                onClick={() => onAnalyzeJob(currentJob)}
+                type="button"
+              >
+                {analysisBusy ? "Analyzing..." : "Analyze job with AI"}
+              </button>
             </div>
+          </div>
+
+          <div className="analysis-grid">
+            <article>
+              <span>Strengths</span>
+              <ul className="compact-list">
+                {(currentJob.analysis?.strengths ?? ["Profile strengths will appear here"]).map(
+                  (item) => (
+                    <li key={item}>{item}</li>
+                  )
+                )}
+              </ul>
+            </article>
+            <article>
+              <span>Missing skills</span>
+              <ul className="compact-list">
+                {(currentJob.analysis?.missing_skills ?? ["Skill gaps will appear here"]).map(
+                  (item) => (
+                    <li key={item}>{item}</li>
+                  )
+                )}
+              </ul>
+            </article>
+          </div>
+
+          <div className="detail-column">
+            <span>Current profile snapshot</span>
+            <p className="muted-text">
+              {profile.years_of_experience} years experience, {profile.work_format} work preference,
+              stack: {profile.tech_stack.join(", ")}
+            </p>
           </div>
         </article>
       </section>
