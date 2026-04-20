@@ -8,10 +8,10 @@ import {
   useState
 } from "react";
 import {
+  BrowserRouter as Router,
   Navigate,
   NavLink,
   Route,
-  BrowserRouter as Router,
   Routes,
   useNavigate,
   useParams
@@ -29,6 +29,8 @@ import type {
   AuthResponse,
   Job,
   JobAnalysis,
+  JobMessage,
+  JobMetadata,
   JobStatus,
   Recommendation,
   User,
@@ -71,9 +73,11 @@ type JobPageProps = {
   jobs: Job[];
   jobError: string;
   analysisBusyId: number | null;
+  messageBusyId: number | null;
   profile: UserProfile;
   onAnalyzeJob: (job: Job) => Promise<void>;
   onDeleteJob: (jobId: number) => Promise<void>;
+  onSendMessage: (job: Job, message: string) => Promise<void>;
   onStatusChange: (job: Job, status: JobStatus) => Promise<void>;
   onSaveJob: (jobId: number, payload: Partial<JobEditableFields>) => Promise<void>;
 };
@@ -88,6 +92,13 @@ type AppShellProps = {
 };
 
 type JobEditableFields = Pick<Job, "company" | "title" | "link" | "notes">;
+
+type AssistantCommandResult = {
+  assistantContent: string;
+  metadataPatch?: Partial<JobMetadata>;
+  statusPatch?: JobStatus;
+  notesAppend?: string;
+};
 
 const demoUser: User = {
   id: 1,
@@ -112,6 +123,15 @@ const demoProfileSeed: UserProfile = {
   work_format: "remote"
 };
 
+function createMessage(role: JobMessage["role"], content: string, createdAt?: string): JobMessage {
+  return {
+    id: `${role}-${createdAt ?? new Date().toISOString()}-${Math.random().toString(36).slice(2, 8)}`,
+    role,
+    content,
+    created_at: createdAt ?? new Date().toISOString()
+  };
+}
+
 const demoJobsSeed: Job[] = [
   {
     id: 101,
@@ -125,12 +145,40 @@ const demoJobsSeed: Job[] = [
     extracted_requirements: ["React", "TypeScript", "Frontend Architecture", "Product Thinking"],
     analysis: {
       match_score: 88,
-      strengths: ["Strong React experience", "Solid TypeScript background", "Product-oriented frontend fit"],
+      strengths: [
+        "Strong React experience",
+        "Solid TypeScript background",
+        "Product-oriented frontend fit"
+      ],
       missing_skills: ["None critical"],
       seniority_fit: "good fit",
       recommendation: "apply",
       summary: "This role aligns well with your strongest frontend skills and portfolio direction."
     },
+    metadata: {
+      application_date: "2026-04-19",
+      follow_up_date: "2026-04-24",
+      contact_person: "Mia Johnson",
+      source: "Stripe careers",
+      notes_summary: "Already applied. Prepare follow-up and interview prep notes."
+    },
+    messages: [
+      createMessage(
+        "assistant",
+        "This workspace is scoped to Stripe only. Ask me about fit, follow-ups, or update the application details with natural language.",
+        "2026-04-19T10:00:00.000Z"
+      ),
+      createMessage(
+        "user",
+        "Recruiter is Mia Johnson",
+        "2026-04-19T10:03:00.000Z"
+      ),
+      createMessage(
+        "assistant",
+        "Got it. I saved Mia Johnson as the contact person for this application.",
+        "2026-04-19T10:03:03.000Z"
+      )
+    ],
     created_at: "2026-04-18T09:00:00.000Z",
     updated_at: "2026-04-19T14:30:00.000Z"
   },
@@ -145,6 +193,17 @@ const demoJobsSeed: Job[] = [
       "Own full product slices across React, TypeScript, API integrations, and UX polish. Work closely with product and design in a fast-moving team.",
     extracted_requirements: ["React", "TypeScript", "API Integrations", "UX Polish", "Product Thinking"],
     analysis: null,
+    metadata: {
+      source: "Linear careers",
+      notes_summary: "Still evaluating whether this should move to applied."
+    },
+    messages: [
+      createMessage(
+        "assistant",
+        "This job is still in your saved pipeline. I can help you evaluate fit or capture structured details before you apply.",
+        "2026-04-19T11:16:00.000Z"
+      )
+    ],
     created_at: "2026-04-19T11:15:00.000Z",
     updated_at: "2026-04-19T11:15:00.000Z"
   },
@@ -159,6 +218,16 @@ const demoJobsSeed: Job[] = [
       "Ship full-stack features using React, Python APIs, PostgreSQL, and cloud tooling. Comfortable across product delivery and backend fundamentals.",
     extracted_requirements: ["React", "Python", "APIs", "PostgreSQL", "Cloud Tooling"],
     analysis: null,
+    metadata: {
+      source: "Remote careers"
+    },
+    messages: [
+      createMessage(
+        "assistant",
+        "I can track application dates, follow-up reminders, recruiter names, and notes here once you start engaging with this role.",
+        "2026-04-20T08:25:00.000Z"
+      )
+    ],
     created_at: "2026-04-20T08:20:00.000Z",
     updated_at: "2026-04-20T08:20:00.000Z"
   }
@@ -196,6 +265,23 @@ function saveDemoProfile(profile: UserProfile) {
 
 function normalizeToken(input: string): string {
   return input.trim().toLowerCase();
+}
+
+function todayIsoDate(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDaysIsoDate(days: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function formatDisplayDate(value?: string): string {
+  if (!value) {
+    return "Not set";
+  }
+  return new Date(`${value}T00:00:00`).toLocaleDateString();
 }
 
 function inferRequirements(job: Job): string[] {
@@ -273,6 +359,120 @@ function analyzeJobAgainstProfile(job: Job, profile: UserProfile): JobAnalysis {
   };
 }
 
+function parseAssistantCommand(job: Job, message: string): AssistantCommandResult | null {
+  const lower = message.trim().toLowerCase();
+
+  if (lower === "i applied today" || lower.includes("i applied today")) {
+    return {
+      statusPatch: "applied",
+      metadataPatch: {
+        application_date: todayIsoDate()
+      },
+      assistantContent: "Saved. I marked this job as applied and set the application date to today."
+    };
+  }
+
+  const recruiterMatch = message.match(/recruiter is (.+)/i);
+  if (recruiterMatch) {
+    return {
+      metadataPatch: {
+        contact_person: recruiterMatch[1].trim()
+      },
+      assistantContent: `Got it. I saved ${recruiterMatch[1].trim()} as the contact person for this job.`
+    };
+  }
+
+  const followUpInDaysMatch = message.match(/follow up in (\d+) days?/i);
+  if (followUpInDaysMatch) {
+    const days = Number(followUpInDaysMatch[1]);
+    return {
+      metadataPatch: {
+        follow_up_date: addDaysIsoDate(days)
+      },
+      assistantContent: `Done. I scheduled the follow-up for ${formatDisplayDate(addDaysIsoDate(days))}.`
+    };
+  }
+
+  const followUpOnDateMatch = message.match(/follow up on (\d{4}-\d{2}-\d{2})/i);
+  if (followUpOnDateMatch) {
+    return {
+      metadataPatch: {
+        follow_up_date: followUpOnDateMatch[1]
+      },
+      assistantContent: `Done. I saved the follow-up date as ${formatDisplayDate(
+        followUpOnDateMatch[1]
+      )}.`
+    };
+  }
+
+  const noteMatch = message.match(/note[:\-]?\s+(.+)/i);
+  if (noteMatch) {
+    return {
+      notesAppend: noteMatch[1].trim(),
+      metadataPatch: {
+        notes_summary: noteMatch[1].trim()
+      },
+      assistantContent: "Saved. I added that note to this workspace."
+    };
+  }
+
+  const contactMatch = message.match(/contact person is (.+)/i);
+  if (contactMatch) {
+    return {
+      metadataPatch: {
+        contact_person: contactMatch[1].trim()
+      },
+      assistantContent: `Saved. ${contactMatch[1].trim()} is now stored as the contact person.`
+    };
+  }
+
+  if (lower.includes("summarize fit") || lower.includes("why is this a good fit")) {
+    return {
+      assistantContent: job.analysis
+        ? `${job.analysis.summary} Strengths: ${job.analysis.strengths.join(
+            ", "
+          )}. Missing skills: ${job.analysis.missing_skills.join(", ")}.`
+        : "Run analysis first and I’ll summarize the fit using your candidate profile."
+    };
+  }
+
+  if (lower.includes("what should i do next")) {
+    const nextStep =
+      job.status === "applied"
+        ? job.metadata?.follow_up_date
+          ? `Your next clear move is to follow up on ${formatDisplayDate(job.metadata.follow_up_date)}.`
+          : "You already applied, so the next strong step is to set a follow-up date."
+        : "This role is still saved, so decide whether to apply or keep researching the fit.";
+
+    return {
+      assistantContent: `${nextStep} I can also save recruiter details or reminders from a short command.`
+    };
+  }
+
+  return null;
+}
+
+function buildAssistantReply(job: Job, profile: UserProfile, message: string): AssistantCommandResult {
+  const commandResult = parseAssistantCommand(job, message);
+  if (commandResult) {
+    return commandResult;
+  }
+
+  if (!job.analysis) {
+    return {
+      assistantContent:
+        "I can help with this role, but the strongest next step is to run job analysis first so I can answer with clearer fit context."
+    };
+  }
+
+  const topStrength = job.analysis.strengths[0] ?? "your transferable engineering background";
+  const topGap = job.analysis.missing_skills[0] ?? "no major skill gaps";
+
+  return {
+    assistantContent: `For ${job.company}, your strongest angle is ${topStrength.toLowerCase()}. The biggest gap is ${topGap.toLowerCase()}. Based on your ${profile.years_of_experience} years of experience, I’d position you as a ${job.analysis.seniority_fit} candidate and focus your application on execution plus product impact.`
+  };
+}
+
 function App() {
   const [authMode, setAuthMode] = useState<AuthFormMode>("register");
   const [session, setSession] = useState<SessionState>(() => {
@@ -290,6 +490,7 @@ function App() {
   const [profileMessage, setProfileMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [analysisBusyId, setAnalysisBusyId] = useState<number | null>(null);
+  const [messageBusyId, setMessageBusyId] = useState<number | null>(null);
   const [formState, setFormState] = useState(initialJobForm);
 
   const savedJobs = useMemo(() => jobs.filter((job) => job.status === "saved"), [jobs]);
@@ -363,6 +564,10 @@ function App() {
       setJobError("");
       if (isDemoSession(session.token)) {
         const now = new Date().toISOString();
+        const metadata: JobMetadata = {
+          source: "Manual entry",
+          notes_summary: formState.notes || "New opportunity added to the pipeline."
+        };
         const createdJob: Job = {
           id: Date.now(),
           company: formState.company,
@@ -382,6 +587,14 @@ function App() {
             updated_at: now
           }),
           analysis: null,
+          metadata,
+          messages: [
+            createMessage(
+              "assistant",
+              `Workspace created for ${formState.company}. You can ask me to track recruiter details, application dates, follow-ups, and notes for this role.`,
+              now
+            )
+          ],
           created_at: now,
           updated_at: now
         };
@@ -412,7 +625,13 @@ function App() {
       if (isDemoSession(session.token)) {
         setJobs((currentJobs) => {
           const nextJobs = currentJobs.map((item) =>
-            item.id === job.id ? { ...item, status, updated_at: new Date().toISOString() } : item
+            item.id === job.id
+              ? {
+                  ...item,
+                  status,
+                  updated_at: new Date().toISOString()
+                }
+              : item
           );
           saveDemoJobs(nextJobs);
           return nextJobs;
@@ -448,6 +667,10 @@ function App() {
                     ...payload,
                     job_description: payload.notes ?? item.job_description
                   }),
+                  metadata: {
+                    ...item.metadata,
+                    notes_summary: payload.notes ?? item.metadata?.notes_summary
+                  },
                   updated_at: new Date().toISOString()
                 }
               : item
@@ -511,6 +734,63 @@ function App() {
       }
     } finally {
       setAnalysisBusyId(null);
+    }
+  }
+
+  async function handleSendMessage(job: Job, message: string) {
+    if (!session.token) {
+      return;
+    }
+
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    setMessageBusyId(job.id);
+
+    try {
+      if (isDemoSession(session.token)) {
+        const result = buildAssistantReply(job, profile, trimmed);
+        const timestamp = new Date().toISOString();
+        const userMessage = createMessage("user", trimmed, timestamp);
+        const assistantMessage = createMessage(
+          "assistant",
+          result.assistantContent,
+          new Date(Date.now() + 500).toISOString()
+        );
+
+        setJobs((currentJobs) => {
+          const nextJobs = currentJobs.map((item) => {
+            if (item.id !== job.id) {
+              return item;
+            }
+
+            const nextMessages = [...(item.messages ?? []), userMessage, assistantMessage];
+            const nextMetadata = {
+              ...(item.metadata ?? {}),
+              ...(result.metadataPatch ?? {})
+            };
+            const appendedNotes = result.notesAppend
+              ? [item.notes, result.notesAppend].filter(Boolean).join("\n")
+              : item.notes;
+
+            return {
+              ...item,
+              status: result.statusPatch ?? item.status,
+              notes: appendedNotes,
+              metadata: nextMetadata,
+              messages: nextMessages,
+              updated_at: new Date().toISOString()
+            };
+          });
+
+          saveDemoJobs(nextJobs);
+          return nextJobs;
+        });
+      }
+    } finally {
+      setMessageBusyId(null);
     }
   }
 
@@ -608,8 +888,8 @@ function App() {
                   loading={loading}
                   onCreateJob={handleCreateJob}
                   onSaveProfile={handleSaveProfile}
-                  profileMessage={profileMessage}
                   profile={profile}
+                  profileMessage={profileMessage}
                   savedJobs={savedJobs}
                   setFormState={setFormState}
                 />
@@ -634,9 +914,11 @@ function App() {
                   analysisBusyId={analysisBusyId}
                   jobError={jobError}
                   jobs={jobs}
+                  messageBusyId={messageBusyId}
                   onAnalyzeJob={handleAnalyzeJob}
                   onDeleteJob={handleDeleteJob}
                   onSaveJob={handleSaveJob}
+                  onSendMessage={handleSendMessage}
                   onStatusChange={handleStatusChange}
                   profile={profile}
                 />
@@ -672,27 +954,28 @@ function AuthPage({
     <main className="auth-shell">
       <section className="hero-panel">
         <p className="eyebrow">Portfolio Project</p>
-        <h1>AI-powered job tracker with a real product shape from day one.</h1>
+        <h1>AI-powered job tracker with a dedicated workspace for every application.</h1>
         <p className="hero-copy">
-          Stage 2 now adds candidate-profile-driven job analysis with structured match score,
-          strengths, missing skills, and clear apply or skip guidance.
+          Stage 3 turns each job into its own context-aware workspace with chat history, structured
+          metadata, and natural-language updates like application dates, recruiter names, and
+          follow-up reminders.
         </p>
         <div className="hero-grid">
           <article>
-            <span>MVP</span>
-            <strong>Auth, dashboard, saved/applied flows</strong>
+            <span>Workspace</span>
+            <strong>Each applied job now has its own scoped chat</strong>
           </article>
           <article>
-            <span>Smart matching</span>
-            <strong>Structured scoring from candidate profile to role fit</strong>
+            <span>Metadata</span>
+            <strong>Track recruiter, dates, follow-ups, and notes</strong>
           </article>
           <article>
-            <span>Backend</span>
-            <strong>Frontend remains ready for future analysis APIs</strong>
+            <span>Assistant</span>
+            <strong>Natural language updates job data inside the workspace</strong>
           </article>
           <article>
             <span>Next</span>
-            <strong>Per-job chat and structured application workspace</strong>
+            <strong>Real Claude API and automation can plug into this flow later</strong>
           </article>
         </div>
       </section>
@@ -836,8 +1119,8 @@ function DashboardPage({
   loading,
   onCreateJob,
   onSaveProfile,
-  profileMessage,
   profile,
+  profileMessage,
   savedJobs,
   setFormState
 }: DashboardPageProps) {
@@ -848,8 +1131,8 @@ function DashboardPage({
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">Stage 2 active</p>
-          <h1>Track your job search and evaluate roles against your candidate profile</h1>
+          <p className="eyebrow">Stage 3 active</p>
+          <h1>Track jobs, score fit, and manage each application as its own workspace</h1>
         </div>
         <div className="topbar-metrics">
           <article>
@@ -918,7 +1201,7 @@ function DashboardPage({
                 onChange={(event) =>
                   setFormState((current) => ({ ...current, notes: event.target.value }))
                 }
-                placeholder="Paste requirements, salary hints, recruiter context, or why the role matters..."
+                placeholder="Paste requirements, recruiter context, or why the role matters..."
                 rows={5}
               />
             </label>
@@ -1042,15 +1325,15 @@ function DashboardPage({
         <article className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Why Stage 2 matters</p>
-              <h2>Structured AI output</h2>
+              <p className="eyebrow">Stage 3 outcome</p>
+              <h2>Dedicated workspace per job</h2>
             </div>
           </div>
           <ul className="feature-list">
-            <li>Profile becomes the source of truth for evaluating roles</li>
-            <li>Every job can produce a clear match score and recommendation</li>
-            <li>No wall-of-text output, only structured decision support</li>
-            <li>This is the bridge from tracker to real AI product behavior</li>
+            <li>Each job now has its own scoped chat history</li>
+            <li>Structured metadata lives next to the conversation</li>
+            <li>Natural language updates recruiter, dates, and notes</li>
+            <li>This is the foundation for a real agent-like assistant</li>
           </ul>
         </article>
       </section>
@@ -1062,9 +1345,11 @@ function JobPage({
   analysisBusyId,
   jobError,
   jobs,
+  messageBusyId,
   onAnalyzeJob,
   onDeleteJob,
   onSaveJob,
+  onSendMessage,
   onStatusChange,
   profile
 }: JobPageProps) {
@@ -1072,6 +1357,7 @@ function JobPage({
   const navigate = useNavigate();
   const jobId = Number(params.jobId);
   const job = jobs.find((item) => item.id === jobId) ?? null;
+  const [chatInput, setChatInput] = useState("");
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [editState, setEditState] = useState<JobEditableFields>({
@@ -1109,6 +1395,15 @@ function JobPage({
 
   const currentJob = job;
   const isAnalyzingCurrentJob = analysisBusyId === currentJob.id;
+  const isMessagingCurrentJob = messageBusyId === currentJob.id;
+  const messages = currentJob.messages ?? [];
+  const metadata = currentJob.metadata ?? {};
+  const quickCommands = [
+    "I applied today",
+    "Recruiter is Anna Smith",
+    "Follow up in 3 days",
+    "Note: strong React match, prepare portfolio examples"
+  ];
 
   async function submitEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1121,6 +1416,12 @@ function JobPage({
   async function removeJob() {
     await onDeleteJob(currentJob.id);
     navigate("/dashboard");
+  }
+
+  async function submitChat(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await onSendMessage(currentJob, chatInput);
+    setChatInput("");
   }
 
   return (
@@ -1149,186 +1450,272 @@ function JobPage({
         </div>
       </header>
 
-      <section className="workspace-grid">
-        <article className="panel workspace-panel">
+      <section className="stage-three-grid">
+        <article className="panel chat-panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Details</p>
-              <h2>{currentJob.company}</h2>
+              <p className="eyebrow">Job chat</p>
+              <h2>{currentJob.company} workspace</h2>
             </div>
             <span className={`status-pill ${currentJob.status}`}>{currentJob.status}</span>
           </div>
 
-          {isEditing ? (
-            <form className="job-form" onSubmit={submitEdit}>
-              <label>
-                Company
-                <input
-                  value={editState.company}
-                  onChange={(event) =>
-                    setEditState((current) => ({ ...current, company: event.target.value }))
-                  }
-                  required
-                />
-              </label>
-              <label>
-                Position title
-                <input
-                  value={editState.title}
-                  onChange={(event) =>
-                    setEditState((current) => ({ ...current, title: event.target.value }))
-                  }
-                  required
-                />
-              </label>
-              <label>
-                Job link
-                <input
-                  type="url"
-                  value={editState.link}
-                  onChange={(event) =>
-                    setEditState((current) => ({ ...current, link: event.target.value }))
-                  }
-                  required
-                />
-              </label>
-              <label>
-                Job description or notes
-                <textarea
-                  rows={7}
-                  value={editState.notes}
-                  onChange={(event) =>
-                    setEditState((current) => ({ ...current, notes: event.target.value }))
-                  }
-                />
-              </label>
-              {jobError ? <p className="error-text">{jobError}</p> : null}
-              <div className="job-actions">
-                <button className="primary-button" disabled={isSaving} type="submit">
-                  {isSaving ? "Saving..." : "Save changes"}
-                </button>
-                <button
-                  className="ghost-button"
-                  onClick={() => setIsEditing(false)}
-                  type="button"
-                >
-                  Cancel
-                </button>
-              </div>
-            </form>
-          ) : (
-            <div className="job-detail">
-              <div className="detail-row">
-                <span>Company</span>
-                <strong>{currentJob.company}</strong>
-              </div>
-              <div className="detail-row">
-                <span>Position</span>
-                <strong>{currentJob.title}</strong>
-              </div>
-              <div className="detail-row">
-                <span>Created</span>
-                <strong>{new Date(currentJob.created_at).toLocaleDateString()}</strong>
-              </div>
-              <div className="detail-column">
-                <span>Source</span>
-                <a href={currentJob.link} rel="noreferrer" target="_blank">
-                  {currentJob.link}
-                </a>
-              </div>
-              <div className="detail-column">
-                <span>Description / notes</span>
-                <p>{currentJob.notes || "No notes yet."}</p>
-              </div>
-              <div className="detail-column">
-                <span>Detected requirements</span>
-                <div className="tag-row">
-                  {inferRequirements(currentJob).map((item) => (
-                    <span key={item} className="tag">
-                      {item}
-                    </span>
-                  ))}
+          <div className="message-list">
+            {messages.map((message) => (
+              <article key={message.id} className={`message-bubble ${message.role}`}>
+                <div className="message-meta">
+                  <strong>{message.role === "assistant" ? "Assistant" : "You"}</strong>
+                  <span>{new Date(message.created_at).toLocaleString()}</span>
                 </div>
-              </div>
-              {jobError ? <p className="error-text">{jobError}</p> : null}
-              <div className="job-actions">
-                <button className="secondary-button" onClick={() => setIsEditing(true)} type="button">
-                  Edit details
-                </button>
-              </div>
-            </div>
-          )}
-        </article>
-
-        <article className="panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">AI evaluation</p>
-              <h2>Profile-based job analysis</h2>
-            </div>
+                <p>{message.content}</p>
+              </article>
+            ))}
           </div>
-          <div className="analysis-panel">
-            <div className="score-ring score-ring-active">
-              <strong>{currentJob.analysis ? `${currentJob.analysis.match_score}%` : "--"}</strong>
-              <span>Match</span>
-            </div>
-            <div className="analysis-content">
-              <div className="detail-row">
-                <span>Recommendation</span>
-                <strong className={`recommendation-pill ${currentJob.analysis?.recommendation ?? "consider"}`}>
-                  {currentJob.analysis?.recommendation ?? "not analyzed"}
-                </strong>
-              </div>
-              <div className="detail-row">
-                <span>Seniority fit</span>
-                <strong>{currentJob.analysis?.seniority_fit ?? "unknown"}</strong>
-              </div>
-              <p className="muted-text">
-                {currentJob.analysis?.summary ??
-                  "Run job analysis to compare this role against your candidate profile."}
-              </p>
+
+          <div className="command-row">
+            {quickCommands.map((command) => (
               <button
-                className="primary-button"
-                disabled={isAnalyzingCurrentJob}
-                onClick={() => onAnalyzeJob(currentJob)}
+                key={command}
+                className="command-chip"
+                onClick={() => setChatInput(command)}
                 type="button"
               >
-                {isAnalyzingCurrentJob ? "Analyzing..." : "Analyze fit"}
+                {command}
+              </button>
+            ))}
+          </div>
+
+          <form className="chat-form" onSubmit={submitChat}>
+            <textarea
+              onChange={(event) => setChatInput(event.target.value)}
+              placeholder="Try: I applied today, Recruiter is Anna Smith, Follow up in 3 days..."
+              rows={4}
+              value={chatInput}
+            />
+            <div className="chat-form-footer">
+              <p className="muted-text">
+                This assistant is scoped only to {currentJob.company} and its workspace data.
+              </p>
+              <button className="primary-button" disabled={isMessagingCurrentJob} type="submit">
+                {isMessagingCurrentJob ? "Updating..." : "Send message"}
               </button>
             </div>
-          </div>
-
-          <div className="analysis-grid">
-            <article>
-              <span>Strengths</span>
-              <ul className="compact-list">
-                {(currentJob.analysis?.strengths ?? ["Profile strengths will appear here"]).map(
-                  (item) => (
-                    <li key={item}>{item}</li>
-                  )
-                )}
-              </ul>
-            </article>
-            <article>
-              <span>Missing skills</span>
-              <ul className="compact-list">
-                {(currentJob.analysis?.missing_skills ?? ["Skill gaps will appear here"]).map(
-                  (item) => (
-                    <li key={item}>{item}</li>
-                  )
-                )}
-              </ul>
-            </article>
-          </div>
-
-          <div className="detail-column">
-            <span>Candidate profile snapshot</span>
-            <p className="muted-text">
-              {profile.years_of_experience} years experience, {profile.work_format} work preference,
-              stack: {profile.tech_stack.join(", ")}
-            </p>
-          </div>
+          </form>
         </article>
+
+        <section className="section-stack">
+          <article className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Structured data</p>
+                <h2>Application details</h2>
+              </div>
+            </div>
+            <div className="metadata-grid">
+              <article className="metadata-card">
+                <span>Application date</span>
+                <strong>{formatDisplayDate(metadata.application_date)}</strong>
+              </article>
+              <article className="metadata-card">
+                <span>Follow-up date</span>
+                <strong>{formatDisplayDate(metadata.follow_up_date)}</strong>
+              </article>
+              <article className="metadata-card">
+                <span>Contact person</span>
+                <strong>{metadata.contact_person || "Not set"}</strong>
+              </article>
+              <article className="metadata-card">
+                <span>Source</span>
+                <strong>{metadata.source || "Not set"}</strong>
+              </article>
+            </div>
+            <div className="detail-column">
+              <span>Workspace summary</span>
+              <p>{metadata.notes_summary || currentJob.notes || "No summary yet."}</p>
+            </div>
+            <div className="detail-column">
+              <span>Detected requirements</span>
+              <div className="tag-row">
+                {inferRequirements(currentJob).map((item) => (
+                  <span key={item} className="tag">
+                    {item}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </article>
+
+          <article className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Job details</p>
+                <h2>{currentJob.company}</h2>
+              </div>
+            </div>
+
+            {isEditing ? (
+              <form className="job-form" onSubmit={submitEdit}>
+                <label>
+                  Company
+                  <input
+                    value={editState.company}
+                    onChange={(event) =>
+                      setEditState((current) => ({ ...current, company: event.target.value }))
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  Position title
+                  <input
+                    value={editState.title}
+                    onChange={(event) =>
+                      setEditState((current) => ({ ...current, title: event.target.value }))
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  Job link
+                  <input
+                    type="url"
+                    value={editState.link}
+                    onChange={(event) =>
+                      setEditState((current) => ({ ...current, link: event.target.value }))
+                    }
+                    required
+                  />
+                </label>
+                <label>
+                  Job description or notes
+                  <textarea
+                    rows={6}
+                    value={editState.notes}
+                    onChange={(event) =>
+                      setEditState((current) => ({ ...current, notes: event.target.value }))
+                    }
+                  />
+                </label>
+                {jobError ? <p className="error-text">{jobError}</p> : null}
+                <div className="job-actions">
+                  <button className="primary-button" disabled={isSaving} type="submit">
+                    {isSaving ? "Saving..." : "Save changes"}
+                  </button>
+                  <button
+                    className="ghost-button"
+                    onClick={() => setIsEditing(false)}
+                    type="button"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="job-detail">
+                <div className="detail-row">
+                  <span>Company</span>
+                  <strong>{currentJob.company}</strong>
+                </div>
+                <div className="detail-row">
+                  <span>Position</span>
+                  <strong>{currentJob.title}</strong>
+                </div>
+                <div className="detail-row">
+                  <span>Created</span>
+                  <strong>{new Date(currentJob.created_at).toLocaleDateString()}</strong>
+                </div>
+                <div className="detail-column">
+                  <span>Source link</span>
+                  <a href={currentJob.link} rel="noreferrer" target="_blank">
+                    {currentJob.link}
+                  </a>
+                </div>
+                <div className="detail-column">
+                  <span>Description / notes</span>
+                  <p>{currentJob.notes || "No notes yet."}</p>
+                </div>
+                {jobError ? <p className="error-text">{jobError}</p> : null}
+                <div className="job-actions">
+                  <button className="secondary-button" onClick={() => setIsEditing(true)} type="button">
+                    Edit details
+                  </button>
+                </div>
+              </div>
+            )}
+          </article>
+
+          <article className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Fit evaluation</p>
+                <h2>Candidate match</h2>
+              </div>
+            </div>
+            <div className="analysis-panel">
+              <div className="score-ring score-ring-active">
+                <strong>{currentJob.analysis ? `${currentJob.analysis.match_score}%` : "--"}</strong>
+                <span>Match</span>
+              </div>
+              <div className="analysis-content">
+                <div className="detail-row">
+                  <span>Recommendation</span>
+                  <strong
+                    className={`recommendation-pill ${
+                      currentJob.analysis?.recommendation ?? "consider"
+                    }`}
+                  >
+                    {currentJob.analysis?.recommendation ?? "not analyzed"}
+                  </strong>
+                </div>
+                <div className="detail-row">
+                  <span>Seniority fit</span>
+                  <strong>{currentJob.analysis?.seniority_fit ?? "unknown"}</strong>
+                </div>
+                <p className="muted-text">
+                  {currentJob.analysis?.summary ??
+                    "Run job analysis to compare this role against your candidate profile."}
+                </p>
+                <button
+                  className="primary-button"
+                  disabled={isAnalyzingCurrentJob}
+                  onClick={() => onAnalyzeJob(currentJob)}
+                  type="button"
+                >
+                  {isAnalyzingCurrentJob ? "Analyzing..." : "Analyze fit"}
+                </button>
+              </div>
+            </div>
+
+            <div className="analysis-grid">
+              <article>
+                <span>Strengths</span>
+                <ul className="compact-list">
+                  {(currentJob.analysis?.strengths ?? ["Strengths will appear here"]).map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </article>
+              <article>
+                <span>Missing skills</span>
+                <ul className="compact-list">
+                  {(currentJob.analysis?.missing_skills ?? ["Skill gaps will appear here"]).map(
+                    (item) => (
+                      <li key={item}>{item}</li>
+                    )
+                  )}
+                </ul>
+              </article>
+            </div>
+
+            <div className="detail-column">
+              <span>Candidate profile snapshot</span>
+              <p className="muted-text">
+                {profile.years_of_experience} years experience, {profile.work_format} work preference,
+                stack: {profile.tech_stack.join(", ")}
+              </p>
+            </div>
+          </article>
+        </section>
       </section>
     </>
   );
