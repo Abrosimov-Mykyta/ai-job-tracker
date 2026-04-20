@@ -60,6 +60,7 @@ type DashboardPageProps = {
   savedJobs: Job[];
   appliedJobs: Job[];
   profile: UserProfile;
+  profileMessage: string;
   formState: typeof initialJobForm;
   setFormState: Dispatch<SetStateAction<typeof initialJobForm>>;
   onCreateJob: (event: FormEvent<HTMLFormElement>) => Promise<void>;
@@ -69,7 +70,7 @@ type DashboardPageProps = {
 type JobPageProps = {
   jobs: Job[];
   jobError: string;
-  analysisBusy: boolean;
+  analysisBusyId: number | null;
   profile: UserProfile;
   onAnalyzeJob: (job: Job) => Promise<void>;
   onDeleteJob: (jobId: number) => Promise<void>;
@@ -286,6 +287,7 @@ function App() {
   const [profile, setProfile] = useState<UserProfile>(getDemoProfile);
   const [authError, setAuthError] = useState("");
   const [jobError, setJobError] = useState("");
+  const [profileMessage, setProfileMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [analysisBusyId, setAnalysisBusyId] = useState<number | null>(null);
   const [formState, setFormState] = useState(initialJobForm);
@@ -308,6 +310,7 @@ function App() {
       if (isDemoSession(nextToken)) {
         setJobs(getDemoJobs());
         setProfile(getDemoProfile());
+        setProfileMessage("");
         return;
       }
       const items = await fetchJobs(nextToken);
@@ -541,6 +544,7 @@ function App() {
 
     setProfile(nextProfile);
     saveDemoProfile(nextProfile);
+    setProfileMessage("Candidate profile saved.");
   }
 
   function logout() {
@@ -604,6 +608,7 @@ function App() {
                   loading={loading}
                   onCreateJob={handleCreateJob}
                   onSaveProfile={handleSaveProfile}
+                  profileMessage={profileMessage}
                   profile={profile}
                   savedJobs={savedJobs}
                   setFormState={setFormState}
@@ -626,7 +631,7 @@ function App() {
                 userName={session.user.full_name}
               >
                 <JobPage
-                  analysisBusy={analysisBusyId !== null}
+                  analysisBusyId={analysisBusyId}
                   jobError={jobError}
                   jobs={jobs}
                   onAnalyzeJob={handleAnalyzeJob}
@@ -669,8 +674,8 @@ function AuthPage({
         <p className="eyebrow">Portfolio Project</p>
         <h1>AI-powered job tracker with a real product shape from day one.</h1>
         <p className="hero-copy">
-          Stage 2 now adds profile-driven job analysis with structured match score, strengths,
-          missing skills, and clear apply or skip guidance.
+          Stage 2 now adds candidate-profile-driven job analysis with structured match score,
+          strengths, missing skills, and clear apply or skip guidance.
         </p>
         <div className="hero-grid">
           <article>
@@ -678,8 +683,8 @@ function AuthPage({
             <strong>Auth, dashboard, saved/applied flows</strong>
           </article>
           <article>
-            <span>AI analysis</span>
-            <strong>Structured scoring from profile to role fit</strong>
+            <span>Smart matching</span>
+            <strong>Structured scoring from candidate profile to role fit</strong>
           </article>
           <article>
             <span>Backend</span>
@@ -831,6 +836,7 @@ function DashboardPage({
   loading,
   onCreateJob,
   onSaveProfile,
+  profileMessage,
   profile,
   savedJobs,
   setFormState
@@ -843,7 +849,7 @@ function DashboardPage({
       <header className="topbar">
         <div>
           <p className="eyebrow">Stage 2 active</p>
-          <h1>Track your job search and score roles against your profile</h1>
+          <h1>Track your job search and evaluate roles against your candidate profile</h1>
         </div>
         <div className="topbar-metrics">
           <article>
@@ -926,8 +932,8 @@ function DashboardPage({
         <article className="panel panel-accent">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">AI profile</p>
-              <h2>What analysis uses</h2>
+              <p className="eyebrow">Candidate profile</p>
+              <h2>Data used for matching and recommendations</h2>
             </div>
           </div>
           <form className="job-form" onSubmit={onSaveProfile}>
@@ -985,8 +991,9 @@ function DashboardPage({
               </label>
             </div>
             <button className="secondary-button" type="submit">
-              Save profile
+              Save candidate profile
             </button>
+            {profileMessage ? <p className="success-text">{profileMessage}</p> : null}
           </form>
         </article>
       </section>
@@ -1052,7 +1059,7 @@ function DashboardPage({
 }
 
 function JobPage({
-  analysisBusy,
+  analysisBusyId,
   jobError,
   jobs,
   onAnalyzeJob,
@@ -1101,6 +1108,7 @@ function JobPage({
   }
 
   const currentJob = job;
+  const isAnalyzingCurrentJob = analysisBusyId === currentJob.id;
 
   async function submitEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1277,15 +1285,15 @@ function JobPage({
               </div>
               <p className="muted-text">
                 {currentJob.analysis?.summary ??
-                  "Run AI analysis to compare this role against your current profile."}
+                  "Run job analysis to compare this role against your candidate profile."}
               </p>
               <button
                 className="primary-button"
-                disabled={analysisBusy}
+                disabled={isAnalyzingCurrentJob}
                 onClick={() => onAnalyzeJob(currentJob)}
                 type="button"
               >
-                {analysisBusy ? "Analyzing..." : "Analyze job with AI"}
+                {isAnalyzingCurrentJob ? "Analyzing..." : "Analyze fit"}
               </button>
             </div>
           </div>
@@ -1314,7 +1322,7 @@ function JobPage({
           </div>
 
           <div className="detail-column">
-            <span>Current profile snapshot</span>
+            <span>Candidate profile snapshot</span>
             <p className="muted-text">
               {profile.years_of_experience} years experience, {profile.work_format} work preference,
               stack: {profile.tech_stack.join(", ")}

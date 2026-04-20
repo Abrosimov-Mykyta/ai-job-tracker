@@ -585,6 +585,11 @@ a {
   color: #ffb4ad;
 }
 
+.success-text {
+  margin: 0;
+  color: #c5ffdf;
+}
+
 @media (max-width: 1100px) {
   .app-shell,
   .dashboard-grid,
