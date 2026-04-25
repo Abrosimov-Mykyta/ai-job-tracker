@@ -30,6 +30,24 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return (await response.json()) as T;
 }
 
+function normalizeMessage(message: JobMessage, index: number): JobMessage {
+  return {
+    ...message,
+    id: message.id || `${message.role}-${message.created_at || Date.now()}-${index}`
+  };
+}
+
+function normalizeJob(job: Job): Job {
+  return {
+    ...job,
+    job_description: job.job_description ?? "",
+    extracted_requirements: job.extracted_requirements ?? [],
+    analysis: job.analysis ?? null,
+    metadata: job.metadata ?? {},
+    messages: (job.messages ?? []).map(normalizeMessage)
+  };
+}
+
 export function register(payload: {
   full_name: string;
   email: string;
@@ -43,22 +61,46 @@ export function login(payload: { email: string; password: string }): Promise<Aut
 }
 
 export function fetchJobs(token: string): Promise<Job[]> {
-  return request<Job[]>("/jobs", { token });
+  return request<Job[]>("/jobs", { token }).then((jobs) => jobs.map(normalizeJob));
 }
 
 export function createJob(
   token: string,
-  payload: { company: string; title: string; link: string; notes: string }
+  payload: {
+    company: string;
+    title: string;
+    link: string;
+    notes: string;
+    job_description?: string;
+    extracted_requirements?: string[];
+    metadata?: JobMetadata;
+    analysis?: Job["analysis"];
+    messages?: JobMessage[];
+  }
 ): Promise<Job> {
-  return request<Job>("/jobs", { method: "POST", token, body: payload });
+  return request<Job>("/jobs", { method: "POST", token, body: payload }).then(normalizeJob);
 }
 
 export function updateJob(
   token: string,
   jobId: number,
-  payload: Partial<Pick<Job, "company" | "title" | "link" | "status" | "notes">>
+  payload: Partial<
+    Pick<
+      Job,
+      | "company"
+      | "title"
+      | "link"
+      | "status"
+      | "notes"
+      | "job_description"
+      | "extracted_requirements"
+      | "analysis"
+      | "metadata"
+      | "messages"
+    >
+  >
 ): Promise<Job> {
-  return request<Job>(`/jobs/${jobId}`, { method: "PATCH", token, body: payload });
+  return request<Job>(`/jobs/${jobId}`, { method: "PATCH", token, body: payload }).then(normalizeJob);
 }
 
 export function deleteJob(token: string, jobId: number): Promise<void> {
@@ -97,9 +139,24 @@ export function chatJobWithAi(
 ): Promise<{
   assistant_message: JobMessage;
   metadata_patch: JobMetadata | null;
+  workspace_patch:
+    | Partial<Pick<Job, "company" | "title" | "job_description" | "extracted_requirements">>
+    | null;
   notes_append: string | null;
   status_patch: Job["status"] | null;
   provider_mode: "fallback" | "llm";
 }> {
-  return request("/ai/chat", { method: "POST", token, body: payload });
+  return request<{
+    assistant_message: JobMessage;
+    metadata_patch: JobMetadata | null;
+    workspace_patch:
+      | Partial<Pick<Job, "company" | "title" | "job_description" | "extracted_requirements">>
+      | null;
+    notes_append: string | null;
+    status_patch: Job["status"] | null;
+    provider_mode: "fallback" | "llm";
+  }>("/ai/chat", { method: "POST", token, body: payload }).then((result) => ({
+    ...result,
+    assistant_message: normalizeMessage(result.assistant_message, 0)
+  }));
 }

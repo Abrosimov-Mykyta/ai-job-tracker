@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from html import unescape
 import json
 import re
+from uuid import uuid4
 from urllib import error, parse, request
 
 from app.core.config import get_settings
@@ -17,6 +19,7 @@ from app.schemas.ai import (
     JobMetadataPayload,
     ParseJobRequest,
     ParseJobResponse,
+    WorkspacePatchPayload,
 )
 
 settings = get_settings()
@@ -26,9 +29,16 @@ KEYWORDS = [
     "React",
     "TypeScript",
     "JavaScript",
+    "Node.js",
+    "Express.js",
     "Python",
     "FastAPI",
     "PostgreSQL",
+    "Supabase",
+    "Docker",
+    "GraphQL",
+    "REST",
+    "n8n",
     "API",
     "APIs",
     "Product Thinking",
@@ -37,6 +47,28 @@ KEYWORDS = [
     "Cloud",
     "Communication",
 ]
+
+NOISY_TITLE_SUFFIXES = [
+    " | linkedin",
+    " | indeed",
+    " | glassdoor",
+    " | jobs",
+    " - linkedin",
+    " - indeed",
+]
+
+MODEL_FALLBACKS = [
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-20250514",
+]
+
+SOURCE_PLATFORMS = {
+    "indeed",
+    "linkedin",
+    "wellfound",
+    "djinni",
+    "glassdoor",
+}
 
 
 def _normalize(text: str) -> str:
@@ -66,11 +98,419 @@ def _infer_requirements(text: str) -> list[str]:
     return ["Communication", "Execution", "Product Thinking"]
 
 
+def _message(role: str, content: str, created_at: datetime | None = None) -> JobMessagePayload:
+    timestamp = created_at or _now()
+    return JobMessagePayload(
+        id=f"{role}-{uuid4().hex[:10]}",
+        role=role,
+        content=content,
+        created_at=timestamp,
+    )
+
+
+def _strip_html(raw_html: str) -> str:
+    without_scripts = re.sub(r"<(script|style)[^>]*>.*?</\\1>", " ", raw_html, flags=re.I | re.S)
+    without_tags = re.sub(r"<[^>]+>", " ", without_scripts)
+    text = re.sub(r"\s+", " ", unescape(without_tags)).strip()
+    return text[:12000]
+
+
+def _clean_title(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    lower = cleaned.lower()
+    for suffix in NOISY_TITLE_SUFFIXES:
+        if lower.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip(" |-")
+            lower = cleaned.lower()
+    return cleaned
+
+
+def _clean_company(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value).strip(" |-")
+    cleaned = re.sub(r"\b(hiring|careers|jobs)\b.*$", "", cleaned, flags=re.I).strip(" |-")
+    return cleaned
+
+
+def _title_case_slug(value: str) -> str:
+    return " ".join(part.capitalize() for part in re.split(r"[-_]+", value) if part)
+
+
+def _source_host(job_url: str) -> str:
+    return parse.urlparse(job_url).netloc.lower().removeprefix("www.")
+
+
+def _source_domain(job_url: str) -> str:
+    host = _source_host(job_url)
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2:
+        return parts[-2]
+    return host
+
+
+def _extract_job_id(job_url: str) -> str | None:
+    parsed_url = parse.urlparse(job_url)
+    current_job_id = parse.parse_qs(parsed_url.query).get("currentJobId", [])
+    if current_job_id:
+        return current_job_id[0]
+
+    view_match = re.search(r"/view/(\d+)", parsed_url.path)
+    if view_match:
+        return view_match.group(1)
+    return None
+
+
+def _candidate_job_urls(job_url: str) -> list[str]:
+    parsed_url = parse.urlparse(job_url)
+    urls = [job_url]
+    if "linkedin.com" in parsed_url.netloc:
+        job_id = _extract_job_id(job_url)
+        if job_id:
+            urls.insert(0, f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}")
+    return list(dict.fromkeys(urls))
+
+
+def _extract_domain_company(job_url: str) -> str | None:
+    parsed_url = parse.urlparse(job_url)
+    path_parts = [part for part in parsed_url.path.split("/") if part]
+    if "company" in path_parts:
+        idx = path_parts.index("company")
+        if idx + 1 < len(path_parts):
+            return _title_case_slug(path_parts[idx + 1])
+
+    host_parts = [part for part in parsed_url.netloc.split(".") if part and part != "www"]
+    if len(host_parts) >= 2:
+        domain_name = host_parts[-2]
+        if domain_name not in SOURCE_PLATFORMS:
+            return _title_case_slug(domain_name)
+    return None
+
+
+def _extract_title_from_url(job_url: str) -> str | None:
+    parsed_url = parse.urlparse(job_url)
+    query = parse.parse_qs(parsed_url.query)
+
+    for key in ["job_listing_slug", "jk", "vjk"]:
+        values = query.get(key, [])
+        if key == "job_listing_slug" and values:
+            return _title_case_slug(values[0])
+
+    path_parts = [part for part in parsed_url.path.split("/") if part]
+    if path_parts:
+        last = path_parts[-1]
+        cleaned = re.sub(r"^\d+[-_]*", "", last)
+        cleaned = re.sub(r"[-_]*\d+$", "", cleaned)
+        if cleaned and cleaned not in {"jobs", "job", "company", "careers"}:
+            return _title_case_slug(cleaned)
+    return None
+
+
+def _fetch_url_content(job_url: str) -> tuple[str, str]:
+    req = request.Request(
+        job_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+            )
+        },
+        method="GET",
+    )
+    try:
+        with request.urlopen(req, timeout=15) as response:
+            content_type = response.headers.get("content-type", "")
+            raw_body = response.read(200_000).decode("utf-8", errors="ignore")
+    except (error.URLError, TimeoutError, ValueError):
+        return "", ""
+
+    return raw_body, content_type
+
+
+def _fetch_job_page_text(job_url: str) -> str:
+    for candidate_url in _candidate_job_urls(job_url):
+        raw_body, content_type = _fetch_url_content(candidate_url)
+        if not raw_body:
+            continue
+
+        if "text/html" in content_type.lower() or "<html" in raw_body.lower():
+            text = _strip_html(raw_body)
+        else:
+            text = raw_body[:12000].strip()
+
+        if text:
+            return text
+    return ""
+
+
+def _extract_meta(raw_html: str, key: str) -> str | None:
+    patterns = [
+        rf'<meta[^>]+property=["\']{re.escape(key)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+name=["\']{re.escape(key)}["\'][^>]+content=["\']([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw_html, re.I)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _extract_title_company_from_html(raw_html: str, job_url: str) -> tuple[str | None, str | None]:
+    title_candidates = [
+        _extract_meta(raw_html, "og:title"),
+        _extract_meta(raw_html, "twitter:title"),
+    ]
+    title_tag = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.I | re.S)
+    if title_tag:
+        title_candidates.append(title_tag.group(1))
+
+    title = next((candidate for candidate in title_candidates if candidate and candidate.strip()), None)
+    title = _clean_title(title) if title else None
+
+    company = None
+    company_patterns = [
+        r'"companyName":"([^"]+)"',
+        r'"company":"([^"]+)"',
+        r'"hiringOrganization":\{"@type":"Organization","name":"([^"]+)"',
+        r'data-company-name="([^"]+)"',
+    ]
+    for pattern in company_patterns:
+        match = re.search(pattern, raw_html, re.I)
+        if match:
+            company = _clean_company(match.group(1))
+            break
+
+    if not company and title:
+        title_parts = re.split(r"\s+at\s+|\s+\|\s+|\s+-\s+", title, maxsplit=1, flags=re.I)
+        if len(title_parts) == 2:
+            title = _clean_title(title_parts[0])
+            company = _clean_company(title_parts[1])
+
+    if not title and "linkedin.com" in parse.urlparse(job_url).netloc:
+        job_id = _extract_job_id(job_url)
+        if job_id:
+            title = f"LinkedIn job {job_id}"
+
+    return title, company
+
+
+def _extract_job_listings_from_html(raw_html: str) -> list[str]:
+    seen: set[str] = set()
+    listings: list[str] = []
+
+    for match in re.finditer(r'href=["\'](/jobs/[^"\']+)["\'][^>]*>(.*?)</a>', raw_html, re.I | re.S):
+        text = _clean_title(_strip_html(match.group(2)))
+        if len(text) < 4:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        listings.append(text)
+        if len(listings) >= 8:
+            break
+
+    if listings:
+        return listings
+
+    fallback_patterns = [
+        r'<h3[^>]*>(.*?)</h3>',
+        r'<h2[^>]*>(.*?)</h2>',
+    ]
+    for pattern in fallback_patterns:
+        for match in re.finditer(pattern, raw_html, re.I | re.S):
+            text = _clean_title(_strip_html(match.group(1)))
+            if len(text) < 6:
+                continue
+            if any(token in text.lower() for token in ["jobs", "careers", "overview", "people", "funding"]):
+                continue
+            lowered = text.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            listings.append(text)
+            if len(listings) >= 8:
+                return listings
+
+    return listings
+
+
+def _is_blocked_page(raw_html: str) -> bool:
+    lowered = raw_html.lower()
+    blocked_markers = [
+        "blocked - indeed.com",
+        "access denied",
+        "request has been blocked",
+        "please enable js and disable any ad blocker",
+        "captcha-delivery",
+        "challenge-platform",
+        "cloudflare",
+    ]
+    return any(marker in lowered for marker in blocked_markers)
+
+
+def _is_search_results_page(job_url: str, raw_html: str) -> bool:
+    parsed_url = parse.urlparse(job_url)
+    query = parse.parse_qs(parsed_url.query)
+    path = parsed_url.path.lower()
+    lowered = raw_html.lower()
+    return (
+        ("q" in query and path.endswith("/jobs"))
+        or "searchondesktopserp" in parsed_url.query.lower()
+        or "search results" in lowered
+        or "ofertas de emprego" in lowered
+    )
+
+
+def _is_company_page(job_url: str) -> bool:
+    return "/company/" in parse.urlparse(job_url).path.lower()
+
+
+def _is_insufficient_job_content(workspace: AnalyzeJobRequest | ChatJobRequest | ParseJobRequest | object) -> bool:
+    if hasattr(workspace, "workspace"):
+        candidate = workspace.workspace
+    else:
+        candidate = workspace
+    title = getattr(candidate, "title", "") or ""
+    description = getattr(candidate, "job_description", "") or ""
+    notes = getattr(candidate, "notes", "") or ""
+    requirements = getattr(candidate, "extracted_requirements", []) or []
+    combined = f"{title} {description} {notes}".lower()
+    insufficient_markers = [
+        "careers page",
+        "search results page",
+        "no job description available",
+        "not directly extractable",
+        "protected by javascript",
+        "javascript rendering",
+        "requires javascript",
+        "authentication",
+        "require authentication",
+        "not fully available from the provided page content",
+        "blocked",
+        "open a specific role link",
+    ]
+    if any(marker in combined for marker in insufficient_markers):
+        return True
+    if not description.strip():
+        return True
+    if requirements == ["Communication", "Execution", "Product Thinking"]:
+        return True
+    return False
+
+
+def _sanitize_notes_append(note_text: str | None, metadata_patch: JobMetadataPayload | None) -> str | None:
+    if not note_text:
+        return None
+
+    cleaned = note_text
+    if metadata_patch:
+        replacements = [
+            metadata_patch.contact_person and rf"(?:contact|recruiter)\s*:\s*{re.escape(metadata_patch.contact_person)}[.,]?\s*",
+            metadata_patch.source and rf"source\s*:\s*{re.escape(metadata_patch.source)}[.,]?\s*",
+            metadata_patch.application_date and rf"application date\s*:\s*{re.escape(metadata_patch.application_date)}[.,]?\s*",
+            metadata_patch.follow_up_date and rf"follow[- ]?up date\s*:\s*{re.escape(metadata_patch.follow_up_date)}[.,]?\s*",
+        ]
+        for pattern in replacements:
+            if pattern:
+                cleaned = re.sub(pattern, "", cleaned, flags=re.I)
+
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,.;\n")
+    return cleaned or None
+
+
+def _looks_like_company_or_search_page(job_url: str) -> bool:
+    parsed_url = parse.urlparse(job_url)
+    path = parsed_url.path.lower()
+    query = parsed_url.query.lower()
+    return any(
+        marker in path or marker in query
+        for marker in ["/company/", "/search", "/jobs/search", "currentjobid=", "keywords="]
+    )
+
+
+def _compact_list(items: list[str], limit: int = 6) -> str:
+    return ", ".join(items[:limit])
+
+
+def _extract_json_payload(response_text: str) -> dict | None:
+    candidates = [response_text.strip()]
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", response_text, re.S)
+    if fenced_match:
+        candidates.insert(0, fenced_match.group(1))
+
+    brace_match = re.search(r"(\{.*\})", response_text, re.S)
+    if brace_match:
+        candidates.append(brace_match.group(1))
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _extract_jobposting_schema(raw_html: str) -> dict | None:
+    def iter_items(value: object) -> list[dict]:
+        if isinstance(value, dict):
+            items = [value]
+            graph = value.get("@graph")
+            if isinstance(graph, list):
+                for item in graph:
+                    items.extend(iter_items(item))
+            return items
+        if isinstance(value, list):
+            items: list[dict] = []
+            for item in value:
+                items.extend(iter_items(item))
+            return items
+        return []
+
+    for match in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>\s*(.*?)\s*</script>',
+        raw_html,
+        re.I | re.S,
+    ):
+        try:
+            parsed = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        items = iter_items(parsed)
+        for item in items:
+            if isinstance(item, dict) and item.get("@type") == "JobPosting":
+                return item
+    return None
+
+
+def _job_source_text(payload: ParseJobRequest) -> str:
+    if payload.job_html:
+        return payload.job_html.strip()
+
+    fetched_text = _fetch_job_page_text(str(payload.job_url))
+    if fetched_text:
+        return fetched_text
+
+    parsed_url = parse.urlparse(str(payload.job_url))
+    path_tokens = [
+        token
+        for token in re.split(r"[-_/]+", parsed_url.path)
+        if token and token not in {"jobs", "job", "careers", "search"}
+    ]
+    return " ".join(path_tokens) or str(payload.job_url)
+
+
 def parse_job_fallback(payload: ParseJobRequest) -> ParseJobResponse:
     url = str(payload.job_url)
     parsed_url = parse.urlparse(url)
+    source_host = _source_host(url)
+    source_domain = _source_domain(url)
     host_parts = parsed_url.netloc.split(".")
-    company = host_parts[-2].capitalize() if len(host_parts) >= 2 else "Unknown company"
+    company = (
+        "Unknown company"
+        if source_domain in SOURCE_PLATFORMS
+        else host_parts[-2].capitalize() if len(host_parts) >= 2 else "Unknown company"
+    )
 
     path_tokens = [
         token
@@ -79,13 +519,86 @@ def parse_job_fallback(payload: ParseJobRequest) -> ParseJobResponse:
     ]
     title = " ".join(token.capitalize() for token in path_tokens[:5]) or "Job opportunity"
 
-    raw_text = payload.job_html or " ".join(path_tokens) or url
-    requirements = _infer_requirements(raw_text)
-    description = (
+    raw_html, _ = _fetch_url_content(url)
+    blocked_page = _is_blocked_page(raw_html) if raw_html else False
+    search_page = _is_search_results_page(url, raw_html) if raw_html else False
+    company_page = _is_company_page(url)
+    schema_data = _extract_jobposting_schema(raw_html) if raw_html else None
+    html_title, html_company = _extract_title_company_from_html(raw_html, url) if raw_html else (None, None)
+    job_listings = _extract_job_listings_from_html(raw_html) if raw_html else []
+    schema_title = schema_data.get("title") if schema_data else None
+    schema_company = (
+        schema_data.get("hiringOrganization", {}).get("name")
+        if schema_data and isinstance(schema_data.get("hiringOrganization"), dict)
+        else None
+    )
+    if schema_company:
+        company = _clean_company(schema_company)
+    elif html_company:
+        company = html_company
+    elif _extract_domain_company(url):
+        company = _extract_domain_company(url) or company
+
+    raw_text = (
         payload.job_html.strip()
         if payload.job_html
-        else f"Imported from {parsed_url.netloc}. Review the original listing to confirm salary, requirements, and responsibilities."
+        else schema_data.get("description", "")
+        if schema_data and schema_data.get("description")
+        else _strip_html(raw_html)
+        if raw_html
+        else _job_source_text(payload)
     )
+    requirements = _infer_requirements(raw_text)
+    description = raw_text or (
+        f"Imported from {parsed_url.netloc}. Review the original listing to confirm salary, requirements, and responsibilities."
+    )
+    title = _clean_title(schema_title) if schema_title else html_title or _extract_title_from_url(url) or title
+
+    if search_page:
+        company = "Multiple companies"
+        title = f"{source_domain.capitalize()} search results page"
+        description = (
+            f"This link points to a {source_domain.capitalize()} search results page, not a single job posting. "
+            "Open the individual vacancy first for a reliable import of company, title, and requirements."
+        )
+        requirements = []
+    elif blocked_page and source_domain == "indeed":
+        company = "Unknown company"
+        title = _extract_title_from_url(url) or "Indeed job page"
+        description = (
+            "Indeed blocked direct page extraction from this environment, so the exact employer and job details "
+            "could not be verified. Open the specific job page directly or paste the visible job text for a cleaner import."
+        )
+        requirements = []
+    elif company_page and company != "Unknown company":
+        title = f"{company} careers page"
+        listing_preview = _compact_list(job_listings, limit=5)
+        description = (
+            f"This looks like a company careers page rather than one specific vacancy. "
+            f"{f'Visible openings include: {listing_preview}. ' if listing_preview else ''}"
+            "Open a specific role link for a cleaner import."
+        )
+        requirements = _infer_requirements(f"{raw_text} {listing_preview}") if listing_preview else []
+    elif blocked_page and source_domain == "wellfound":
+        company = html_company or schema_company or company
+        title = _extract_title_from_url(url) or "Wellfound job page"
+        description = (
+            "Wellfound blocked direct extraction from this environment, so only limited job information was available. "
+            "If you open the exact job page text or paste the description here, the import will become much more accurate."
+        )
+        requirements = []
+
+    if _looks_like_company_or_search_page(url) and job_listings and not schema_title and not search_page:
+        title = f"{company} careers page"
+        listing_preview = _compact_list(job_listings, limit=5)
+        description = (
+            f"This looks like a company careers or search page, not a single job post. "
+            f"Visible roles include: {listing_preview}. Open a specific role link for a cleaner import."
+        )
+        requirements = _infer_requirements(f"{raw_text} {listing_preview}")
+
+    if title.lower() == "unknown":
+        title = "Job opportunity"
 
     return ParseJobResponse(
         company=company,
@@ -93,7 +606,7 @@ def parse_job_fallback(payload: ParseJobRequest) -> ParseJobResponse:
         link=url,
         job_description=description,
         extracted_requirements=requirements,
-        metadata=JobMetadataPayload(source=parsed_url.netloc, notes_summary="Imported from job link."),
+        metadata=JobMetadataPayload(source=source_host, notes_summary="Imported from job link."),
         parser_mode="fallback",
     )
 
@@ -101,6 +614,50 @@ def parse_job_fallback(payload: ParseJobRequest) -> ParseJobResponse:
 def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
     workspace = payload.workspace
     profile = payload.profile
+    if _is_insufficient_job_content(workspace):
+        combined = f"{workspace.title} {workspace.job_description} {workspace.notes}".lower()
+        strengths = ["Need more job detail"]
+        missing = ["Specific job requirements unavailable"]
+        summary = (
+            "This link does not expose enough job-specific detail for a trustworthy fit score yet. "
+            "Open a single vacancy page or paste the job description to get a real analysis."
+        )
+
+        if "search results page" in combined:
+            strengths = ["Broad search context captured"]
+            missing = ["Single vacancy details unavailable"]
+            summary = (
+                "This is a search results page, not one specific vacancy, so the fit score would be misleading. "
+                "Open the exact posting you want to evaluate."
+            )
+        elif "careers page" in combined:
+            strengths = ["Company context identified"]
+            missing = ["Specific role requirements unavailable"]
+            summary = (
+                "This looks like a careers page rather than one concrete role, so the fit score is only provisional. "
+                "Open an individual listing for a real analysis."
+            )
+        elif "authentication" in combined or "javascript" in combined or "blocked" in combined:
+            strengths = ["Role title identified"]
+            missing = ["Full job description unavailable"]
+            summary = (
+                "The job source hides most of the vacancy behind JavaScript or authentication, so this score is intentionally conservative. "
+                "Paste the visible job description to get a better fit read."
+            )
+
+        analysis = JobAnalysisPayload(
+            match_score=42,
+            strengths=strengths,
+            missing_skills=missing,
+            seniority_fit="good fit",
+            recommendation="consider",
+            summary=summary,
+        )
+        metadata = payload.workspace.metadata or JobMetadataPayload()
+        if not metadata.notes_summary:
+            metadata.notes_summary = "Limited source data available. Open the exact vacancy for better analysis."
+        return AnalyzeJobResponse(analysis=analysis, metadata=metadata, provider_mode="fallback")
+
     requirements = workspace.extracted_requirements or _infer_requirements(
         f"{workspace.title} {workspace.notes} {workspace.job_description}"
     )
@@ -118,10 +675,10 @@ def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
         _normalize(role.split(" ")[0]) in _normalize(workspace.title) for role in profile.preferred_roles
     )
 
-    score = 48 + len(matched) * 10 + (8 if strong_role_fit else 0)
+    score = 52 + len(matched) * 9 + (8 if strong_role_fit else 0)
     score += min(profile.years_of_experience * 3, 12)
-    score -= len(missing) * 6
-    score = max(22, min(96, score))
+    score -= min(len(missing) * 4, 20)
+    score = max(28, min(94, score))
 
     seniority_fit = "good fit"
     if profile.years_of_experience <= 1 and re.search(r"senior|lead", workspace.title, re.I):
@@ -142,11 +699,11 @@ def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
         seniority_fit=seniority_fit,
         recommendation=recommendation,
         summary=(
-            "Strong overlap between the role and the candidate profile."
+            "Strong overlap between the role and your current profile."
             if recommendation == "apply"
-            else "There is some overlap, but review the gaps before investing more time."
+            else "There is meaningful overlap, but you should review the key gaps before applying."
             if recommendation == "consider"
-            else "This role looks weaker against the current profile and may not be the best target."
+            else "The fit looks weaker right now because too many core requirements are still missing."
         ),
     )
 
@@ -162,6 +719,7 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
     lower = message.lower()
 
     metadata_patch = JobMetadataPayload()
+    workspace_patch = WorkspacePatchPayload()
     status_patch = None
     notes_append = None
 
@@ -171,7 +729,27 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
         metadata_patch.contact_person = recruiter
         content = f"Saved. {recruiter} is now stored as the recruiter/contact person."
         return ChatJobResponse(
-            assistant_message=JobMessagePayload(role="assistant", content=content, created_at=_now()),
+            assistant_message=_message("assistant", content),
+            metadata_patch=metadata_patch,
+            provider_mode="fallback",
+        )
+
+    company_match = re.search(r"(?:change|set)\s+company(?:\s+name)?\s+to\s+(.+)", message, re.I)
+    if company_match:
+        company_name = company_match.group(1).strip()
+        workspace_patch.company = company_name
+        return ChatJobResponse(
+            assistant_message=_message("assistant", f"Saved. I updated the company name to {company_name}."),
+            workspace_patch=workspace_patch,
+            provider_mode="fallback",
+        )
+
+    source_match = re.search(r"(?:change|set)\s+source\s+to\s+(.+)", message, re.I)
+    if source_match:
+        source = source_match.group(1).strip()
+        metadata_patch.source = source
+        return ChatJobResponse(
+            assistant_message=_message("assistant", f"Saved. I updated the source to {source}."),
             metadata_patch=metadata_patch,
             provider_mode="fallback",
         )
@@ -180,10 +758,9 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
         metadata_patch.application_date = _today()
         status_patch = JobStatus.APPLIED
         return ChatJobResponse(
-            assistant_message=JobMessagePayload(
-                role="assistant",
-                content="Saved. I marked this role as applied and set the application date to today.",
-                created_at=_now(),
+            assistant_message=_message(
+                "assistant",
+                "Saved. I marked this role as applied and set the application date to today.",
             ),
             metadata_patch=metadata_patch,
             status_patch=status_patch,
@@ -195,10 +772,9 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
         days = int(follow_up_days_match.group(1))
         metadata_patch.follow_up_date = _days_from_now(days)
         return ChatJobResponse(
-            assistant_message=JobMessagePayload(
-                role="assistant",
-                content=f"Done. I set the follow-up date to {_format_date(metadata_patch.follow_up_date)}.",
-                created_at=_now(),
+            assistant_message=_message(
+                "assistant",
+                f"Done. I set the follow-up date to {_format_date(metadata_patch.follow_up_date)}.",
             ),
             metadata_patch=metadata_patch,
             provider_mode="fallback",
@@ -210,13 +786,25 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
         metadata_patch.notes_summary = note_text
         notes_append = note_text
         return ChatJobResponse(
-            assistant_message=JobMessagePayload(
-                role="assistant",
-                content="Saved. I added that note to the workspace summary and notes.",
-                created_at=_now(),
+            assistant_message=_message(
+                "assistant",
+                "Saved. I added that note to the workspace summary and notes.",
             ),
             metadata_patch=metadata_patch,
             notes_append=notes_append,
+            provider_mode="fallback",
+        )
+
+    if "requirement" in lower or "requirements" in lower:
+        requirements = payload.workspace.extracted_requirements or _infer_requirements(
+            f"{payload.workspace.title} {payload.workspace.job_description} {payload.workspace.notes}"
+        )
+        preview = ", ".join(requirements[:8]) if requirements else "No clear requirements extracted yet."
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                f"The main requirements I can see right now are: {preview}. Run analysis for a fuller fit breakdown.",
+            ),
             provider_mode="fallback",
         )
 
@@ -234,7 +822,7 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
         )
 
     return ChatJobResponse(
-        assistant_message=JobMessagePayload(role="assistant", content=content, created_at=_now()),
+        assistant_message=_message("assistant", content),
         provider_mode="fallback",
     )
 
@@ -243,57 +831,93 @@ def _anthropic_request(system_prompt: str, user_prompt: str) -> str | None:
     if not settings.anthropic_api_key:
         return None
 
-    payload = {
-        "model": settings.anthropic_model,
-        "max_tokens": 1200,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }
+    models_to_try = [settings.anthropic_model, *MODEL_FALLBACKS]
+    seen_models: set[str] = set()
+    for model_name in models_to_try:
+        if not model_name or model_name in seen_models:
+            continue
+        seen_models.add(model_name)
+        payload = {
+            "model": model_name,
+            "max_tokens": 1200,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
 
-    req = request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "content-type": "application/json",
-            "x-api-key": settings.anthropic_api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
+        req = request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "x-api-key": settings.anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
 
-    try:
-        with request.urlopen(req, timeout=45) as response:
-            raw = json.loads(response.read().decode("utf-8"))
-    except (error.URLError, TimeoutError, json.JSONDecodeError):
-        return None
+        try:
+            with request.urlopen(req, timeout=45) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+        except (error.URLError, TimeoutError, json.JSONDecodeError):
+            continue
 
-    content = raw.get("content", [])
-    if not content:
-        return None
-    text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
-    return "\n".join(text_parts).strip() or None
+        content = raw.get("content", [])
+        if not content:
+            continue
+        text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        text = "\n".join(text_parts).strip()
+        if text:
+            return text
+    return None
 
 
 def parse_job_with_optional_llm(payload: ParseJobRequest) -> ParseJobResponse:
     fallback = parse_job_fallback(payload)
+    raw_html, _ = _fetch_url_content(str(payload.job_url))
+    if raw_html and _is_blocked_page(raw_html) and not payload.job_html:
+        return fallback
+    source_text = _job_source_text(payload)
     response_text = _anthropic_request(
         system_prompt=(
-            "Extract company, title, short description, and requirement keywords from a job posting. "
-            "Return strict JSON with keys company, title, job_description, extracted_requirements."
+            "Extract structured job data from the provided page content. "
+            "Return valid JSON only with keys company, title, job_description, extracted_requirements. "
+            "Be precise and concise. Use the actual employer and actual role title from the page. "
+            "If the source is a blocked page, search results page, or company page without one specific vacancy, "
+            "do not use the platform name as the company unless the employer is truly unknown. "
+            "If the URL is a company careers page or listing page rather than a single vacancy, set title to "
+            "'<Company> careers page' and summarize the visible openings in job_description. "
+            "Do not invent missing facts."
         ),
-        user_prompt=f"Job URL: {payload.job_url}\nJob HTML/Text:\n{payload.job_html or ''}",
+        user_prompt=(
+            f"Job URL: {payload.job_url}\n"
+            f"Heuristic company: {fallback.company}\n"
+            f"Heuristic title: {fallback.title}\n"
+            f"Job HTML/Text:\n{source_text}"
+        ),
     )
     if not response_text:
         return fallback
 
-    try:
-        parsed = json.loads(response_text)
-    except json.JSONDecodeError:
+    parsed = _extract_json_payload(response_text)
+    if not parsed:
         return fallback
 
+    company = parsed.get("company") or fallback.company
+    title = parsed.get("title") or fallback.title
+    if (
+        company
+        and _normalize(company) == _normalize(_source_domain(str(payload.job_url)))
+        and fallback.company != company
+    ):
+        company = fallback.company
+    if company and _normalize(company) in {"unknown", "unknown company"}:
+        company = fallback.company if fallback.company not in {"Unknown", "Unknown company"} else "Unknown company"
+    if title and _normalize(title) in {"unknown", "job opportunity"}:
+        title = fallback.title
+
     return ParseJobResponse(
-        company=parsed.get("company") or fallback.company,
-        title=parsed.get("title") or fallback.title,
+        company=company,
+        title=title,
         link=fallback.link,
         job_description=parsed.get("job_description") or fallback.job_description,
         extracted_requirements=parsed.get("extracted_requirements") or fallback.extracted_requirements,
@@ -306,8 +930,13 @@ def analyze_job_with_optional_llm(payload: AnalyzeJobRequest) -> AnalyzeJobRespo
     fallback = analyze_job_fallback(payload)
     response_text = _anthropic_request(
         system_prompt=(
-            "Compare a candidate profile against a job workspace. Return strict JSON with "
-            "match_score, strengths, missing_skills, seniority_fit, recommendation, summary."
+            "Compare a candidate profile against one job workspace. Return valid JSON only with "
+            "match_score, strengths, missing_skills, seniority_fit, recommendation, summary. "
+            "Be nuanced, not overly harsh. Score based on core must-have overlap, seniority, years of experience, "
+            "and transferable skills. Do not penalize every missing keyword equally. "
+            "If the job data is incomplete, blocked, or clearly from a search/careers page, say that directly in the summary, "
+            "keep the score conservative, and do not hallucinate missing requirements. "
+            "Keep strengths and missing_skills concrete and short. Keep summary to one or two sentences."
         ),
         user_prompt=json.dumps(payload.model_dump(mode="json"), ensure_ascii=False),
     )
@@ -315,9 +944,11 @@ def analyze_job_with_optional_llm(payload: AnalyzeJobRequest) -> AnalyzeJobRespo
         return fallback
 
     try:
-        parsed = json.loads(response_text)
+        parsed = _extract_json_payload(response_text)
+        if not parsed:
+            return fallback
         analysis = JobAnalysisPayload(**parsed)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return fallback
 
     return AnalyzeJobResponse(
@@ -331,33 +962,43 @@ def chat_job_with_optional_llm(payload: ChatJobRequest) -> ChatJobResponse:
     fallback = chat_job_fallback(payload)
     response_text = _anthropic_request(
         system_prompt=(
-            "You are a job-specific assistant. Help with this one workspace only. "
-            "If the user gives a structured update command, return strict JSON with "
-            "assistant_message, metadata_patch, notes_append, status_patch."
+            "You are a job-specific assistant for one job workspace. "
+            "Always answer naturally, helpfully, and concisely. "
+            "Prefer plain text in a short paragraph or 3-5 short bullets. "
+            "Avoid markdown headings, tables, bold formatting, and emoji unless the user asks. "
+            "When the user asks about requirements, skills, fit, or next steps, answer directly from the workspace data. "
+            "If the user also updates structured data like recruiter, application date, follow-up date, notes, or status, "
+            "put recruiter/contact, source, dates, and summary fields into metadata_patch. "
+            "Put company, title, job_description, and extracted_requirements corrections into workspace_patch. "
+            "Use notes_append only for genuinely new freeform notes that are not duplicates of structured fields. "
+            "return valid JSON only with keys assistant_message, metadata_patch, workspace_patch, notes_append, status_patch. "
+            "If the user is only asking a normal question, return a plain natural-language answer and do not force JSON."
         ),
         user_prompt=json.dumps(payload.model_dump(mode="json"), ensure_ascii=False),
     )
     if not response_text:
         return fallback
 
-    try:
-        parsed = json.loads(response_text)
-    except json.JSONDecodeError:
-        return fallback
+    parsed = _extract_json_payload(response_text)
+    if not parsed:
+        return ChatJobResponse(
+            assistant_message=_message("assistant", response_text.strip()),
+            provider_mode="llm",
+        )
 
     try:
         assistant_content = parsed.get("assistant_message") or fallback.assistant_message.content
         metadata_patch = (
             JobMetadataPayload(**parsed["metadata_patch"]) if parsed.get("metadata_patch") else None
         )
+        workspace_patch = (
+            WorkspacePatchPayload(**parsed["workspace_patch"]) if parsed.get("workspace_patch") else None
+        )
         return ChatJobResponse(
-            assistant_message=JobMessagePayload(
-                role="assistant",
-                content=assistant_content,
-                created_at=_now(),
-            ),
+            assistant_message=_message("assistant", assistant_content),
             metadata_patch=metadata_patch,
-            notes_append=parsed.get("notes_append"),
+            workspace_patch=workspace_patch,
+            notes_append=_sanitize_notes_append(parsed.get("notes_append"), metadata_patch),
             status_patch=parsed.get("status_patch"),
             provider_mode="llm",
         )

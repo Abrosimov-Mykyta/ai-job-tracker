@@ -31,6 +31,7 @@ class JobMetadataPayload(BaseModel):
 
 
 class JobMessagePayload(BaseModel):
+    id: str | None = None
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=12000)
     created_at: datetime | None = None
@@ -56,6 +57,13 @@ class JobWorkspacePayload(BaseModel):
     metadata: JobMetadataPayload | None = None
     analysis: JobAnalysisPayload | None = None
     messages: list[JobMessagePayload] = Field(default_factory=list)
+
+
+class WorkspacePatchPayload(BaseModel):
+    company: str | None = Field(default=None, min_length=1, max_length=255)
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    job_description: str | None = Field(default=None, max_length=20000)
+    extracted_requirements: list[str] | None = None
 
 
 class ParseJobRequest(BaseModel):
@@ -93,6 +101,7 @@ class ChatJobRequest(BaseModel):
 class ChatJobResponse(BaseModel):
     assistant_message: JobMessagePayload
     metadata_patch: JobMetadataPayload | None = None
+    workspace_patch: WorkspacePatchPayload | None = None
     notes_append: str | None = None
     status_patch: JobStatus | None = None
     provider_mode: Literal["fallback", "llm"]

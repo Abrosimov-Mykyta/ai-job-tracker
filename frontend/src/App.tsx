@@ -1,5 +1,6 @@
 import {
   FormEvent,
+  type KeyboardEvent,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
@@ -17,10 +18,13 @@ import {
   useParams
 } from "react-router-dom";
 import {
+  analyzeJobWithAi,
+  chatJobWithAi,
   createJob,
   deleteJob,
   fetchJobs,
   login,
+  parseJobWithAi,
   register,
   updateJob
 } from "./lib/api";
@@ -56,6 +60,7 @@ type SessionState = {
 };
 
 type DashboardPageProps = {
+  isDemoMode: boolean;
   loading: boolean;
   jobError: string;
   jobs: Job[];
@@ -64,12 +69,15 @@ type DashboardPageProps = {
   profile: UserProfile;
   profileMessage: string;
   formState: typeof initialJobForm;
+  importBusy: boolean;
   setFormState: Dispatch<SetStateAction<typeof initialJobForm>>;
   onCreateJob: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  onImportJob: () => Promise<void>;
   onSaveProfile: (event: FormEvent<HTMLFormElement>) => void;
 };
 
 type JobPageProps = {
+  isDemoMode: boolean;
   jobs: Job[];
   jobError: string;
   analysisBusyId: number | null;
@@ -87,11 +95,14 @@ type AppShellProps = {
   savedJobs: Job[];
   appliedJobs: Job[];
   userName: string;
+  isDemoMode: boolean;
   onLogout: () => void;
   children: ReactNode;
 };
 
 type JobEditableFields = Pick<Job, "company" | "title" | "link" | "notes">;
+
+type ImportedJobDraft = Pick<Job, "job_description" | "extracted_requirements" | "metadata">;
 
 type AssistantCommandResult = {
   assistantContent: string;
@@ -275,6 +286,14 @@ function addDaysIsoDate(days: number): string {
   const date = new Date();
   date.setDate(date.getDate() + days);
   return date.toISOString().slice(0, 10);
+}
+
+function getLinkSourceLabel(link: string): string {
+  try {
+    return new URL(link).hostname.replace(/^www\./, "");
+  } catch {
+    return "Manual entry";
+  }
 }
 
 function formatDisplayDate(value?: string): string {
@@ -490,8 +509,10 @@ function App() {
   const [profileMessage, setProfileMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [analysisBusyId, setAnalysisBusyId] = useState<number | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
   const [messageBusyId, setMessageBusyId] = useState<number | null>(null);
   const [formState, setFormState] = useState(initialJobForm);
+  const [importDraft, setImportDraft] = useState<ImportedJobDraft | null>(null);
 
   const savedJobs = useMemo(() => jobs.filter((job) => job.status === "saved"), [jobs]);
   const appliedJobs = useMemo(() => jobs.filter((job) => job.status === "applied"), [jobs]);
@@ -604,14 +625,112 @@ function App() {
           return nextJobs;
         });
         setFormState(initialJobForm);
+        setImportDraft(null);
         return;
       }
 
-      const createdJob = await createJob(session.token, formState);
+      const now = new Date().toISOString();
+      const starterMessage = createMessage(
+        "assistant",
+        `Workspace created for ${formState.company}. I can parse fit, track recruiter details, and update this application workspace as you go.`,
+        now
+      );
+      const createdJob = await createJob(session.token, {
+        ...formState,
+        job_description: importDraft?.job_description ?? formState.notes,
+        extracted_requirements:
+          importDraft?.extracted_requirements ??
+          inferRequirements({
+            id: 0,
+            company: formState.company,
+            title: formState.title,
+            link: formState.link,
+            notes: formState.notes,
+            status: "saved",
+            job_description: formState.notes,
+            created_at: now,
+            updated_at: now
+          }),
+        metadata:
+          importDraft?.metadata ?? {
+            source: getLinkSourceLabel(formState.link),
+            notes_summary: formState.notes || "New opportunity added to the pipeline."
+          },
+        messages: [starterMessage]
+      });
       setJobs((currentJobs) => [createdJob, ...currentJobs]);
       setFormState(initialJobForm);
+      setImportDraft(null);
     } catch (error) {
       setJobError(error instanceof Error ? error.message : "Could not create job.");
+    }
+  }
+
+  async function handleImportJob() {
+    if (!session.token || !formState.link.trim()) {
+      setJobError("Add a job link first.");
+      return;
+    }
+
+    setImportBusy(true);
+    setJobError("");
+
+    try {
+      if (isDemoSession(session.token)) {
+        const inferredTitle = formState.title || "Imported job";
+        const inferredCompany = formState.company || "Imported company";
+        setFormState((current) => ({
+          ...current,
+          company: inferredCompany,
+          title: inferredTitle,
+          notes:
+            current.notes ||
+            `Imported from link. Review requirements and confirm the job description before applying.`
+        }));
+        setImportDraft({
+          job_description:
+            formState.notes ||
+            "Imported from link. Review requirements and confirm the job description before applying.",
+          extracted_requirements: inferRequirements({
+            id: 0,
+            company: inferredCompany,
+            title: inferredTitle,
+            link: formState.link,
+            notes: formState.notes,
+            status: "saved",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          }),
+          metadata: {
+            source: "Imported link",
+            notes_summary: "Imported from job link."
+          }
+        });
+        return;
+      }
+
+      const parsed = await parseJobWithAi(session.token, { job_url: formState.link });
+      setImportDraft({
+        job_description: parsed.job_description,
+        extracted_requirements: parsed.extracted_requirements,
+        metadata: parsed.metadata
+      });
+      setFormState((current) => ({
+        ...current,
+        company: parsed.company,
+        title: parsed.title,
+        link: parsed.link,
+        notes: parsed.job_description
+      }));
+      setProfileMessage(
+        parsed.parser_mode === "llm"
+          ? "Job link parsed with live AI."
+          : "Job link parsed in fallback mode. Review fields before saving."
+      );
+    } catch (error) {
+      setJobError(error instanceof Error ? error.message : "Could not import this job link.");
+    } finally {
+      setImportBusy(false);
     }
   }
 
@@ -731,7 +850,19 @@ function App() {
           saveDemoJobs(nextJobs);
           return nextJobs;
         });
+      } else if (session.token) {
+        const result = await analyzeJobWithAi(session.token, { profile, workspace: job });
+        const persisted = await updateJob(session.token, job.id, {
+          analysis: result.analysis ?? job.analysis,
+          extracted_requirements: job.extracted_requirements ?? inferRequirements(job),
+          metadata: result.metadata ? { ...(job.metadata ?? {}), ...result.metadata } : job.metadata
+        });
+        setJobs((currentJobs) =>
+          currentJobs.map((item) => (item.id === job.id ? persisted : item))
+        );
       }
+    } catch (error) {
+      setJobError(error instanceof Error ? error.message : "Could not analyze this job.");
     } finally {
       setAnalysisBusyId(null);
     }
@@ -788,7 +919,47 @@ function App() {
           saveDemoJobs(nextJobs);
           return nextJobs;
         });
+      } else {
+        const timestamp = new Date().toISOString();
+        const userMessage = createMessage("user", trimmed, timestamp);
+        setJobs((currentJobs) =>
+          currentJobs.map((item) =>
+            item.id === job.id
+              ? {
+                  ...item,
+                  messages: [...(item.messages ?? []), userMessage],
+                  updated_at: new Date().toISOString()
+                }
+              : item
+          )
+        );
+
+        const result = await chatJobWithAi(session.token, { profile, workspace: job, message: trimmed });
+        const nextMessages = [...(job.messages ?? []), userMessage, result.assistant_message];
+        const nextMetadata = result.metadata_patch
+          ? { ...(job.metadata ?? {}), ...result.metadata_patch }
+          : job.metadata;
+        const nextWorkspacePatch = result.workspace_patch ?? {};
+        const nextNotes = result.notes_append
+          ? [job.notes, result.notes_append].filter(Boolean).join("\n")
+          : job.notes;
+        const persisted = await updateJob(session.token, job.id, {
+          company: nextWorkspacePatch.company ?? job.company,
+          title: nextWorkspacePatch.title ?? job.title,
+          job_description: nextWorkspacePatch.job_description ?? job.job_description,
+          extracted_requirements:
+            nextWorkspacePatch.extracted_requirements ?? job.extracted_requirements,
+          status: result.status_patch ?? job.status,
+          notes: nextNotes,
+          metadata: nextMetadata,
+          messages: nextMessages
+        });
+        setJobs((currentJobs) =>
+          currentJobs.map((item) => (item.id === job.id ? persisted : item))
+        );
       }
+    } catch (error) {
+      setJobError(error instanceof Error ? error.message : "Could not send message.");
     } finally {
       setMessageBusyId(null);
     }
@@ -875,6 +1046,7 @@ function App() {
             isAuthenticated && session.user ? (
               <AppShell
                 appliedJobs={appliedJobs}
+                isDemoMode={isDemoSession(session.token)}
                 jobs={jobs}
                 onLogout={logout}
                 savedJobs={savedJobs}
@@ -883,10 +1055,13 @@ function App() {
                 <DashboardPage
                   appliedJobs={appliedJobs}
                   formState={formState}
+                  isDemoMode={isDemoSession(session.token)}
+                  importBusy={importBusy}
                   jobError={jobError}
                   jobs={jobs}
                   loading={loading}
                   onCreateJob={handleCreateJob}
+                  onImportJob={handleImportJob}
                   onSaveProfile={handleSaveProfile}
                   profile={profile}
                   profileMessage={profileMessage}
@@ -905,6 +1080,7 @@ function App() {
             isAuthenticated && session.user ? (
               <AppShell
                 appliedJobs={appliedJobs}
+                isDemoMode={isDemoSession(session.token)}
                 jobs={jobs}
                 onLogout={logout}
                 savedJobs={savedJobs}
@@ -912,6 +1088,7 @@ function App() {
               >
                 <JobPage
                   analysisBusyId={analysisBusyId}
+                  isDemoMode={isDemoSession(session.token)}
                   jobError={jobError}
                   jobs={jobs}
                   messageBusyId={messageBusyId}
@@ -1020,7 +1197,7 @@ function AuthPage({
               {authMode === "register" ? "Create account" : "Sign in"}
             </button>
             <button className="secondary-button" onClick={onEnterDemoMode} type="button">
-              Try demo mode
+              Try demo data
             </button>
           </div>
         </form>
@@ -1031,6 +1208,7 @@ function AuthPage({
 
 function AppShell({
   appliedJobs,
+  isDemoMode,
   jobs,
   onLogout,
   savedJobs,
@@ -1044,6 +1222,9 @@ function AppShell({
           <div>
             <p className="eyebrow">AI Job Tracker</p>
             <h2>{userName}</h2>
+            <span className={`mode-badge ${isDemoMode ? "demo" : "live"}`}>
+              {isDemoMode ? "Demo mode" : "Live AI mode"}
+            </span>
           </div>
           <button className="ghost-button" onClick={onLogout} type="button">
             Log out
@@ -1114,10 +1295,13 @@ function SidebarSection({ jobs, title }: { jobs: Job[]; title: string }) {
 function DashboardPage({
   appliedJobs,
   formState,
+  isDemoMode,
+  importBusy,
   jobError,
   jobs,
   loading,
   onCreateJob,
+  onImportJob,
   onSaveProfile,
   profile,
   profileMessage,
@@ -1158,6 +1342,12 @@ function DashboardPage({
               <h2>Add a role manually</h2>
             </div>
           </div>
+          {isDemoMode ? (
+            <p className="mode-note">
+              Demo mode shows seeded data only. Log out and sign in to test real link import and
+              live AI responses.
+            </p>
+          ) : null}
 
           <form className="job-form" onSubmit={onCreateJob}>
             <label>
@@ -1206,9 +1396,19 @@ function DashboardPage({
               />
             </label>
             {jobError ? <p className="error-text">{jobError}</p> : null}
-            <button className="primary-button" type="submit">
-              Save job
-            </button>
+            <div className="job-form-actions">
+              <button className="primary-button" type="submit">
+                Save job
+              </button>
+              <button
+                className="secondary-button"
+                disabled={importBusy || isDemoMode}
+                onClick={() => void onImportJob()}
+                type="button"
+              >
+                {isDemoMode ? "Live import unavailable in demo" : importBusy ? "Importing..." : "Import from link"}
+              </button>
+            </div>
           </form>
         </article>
 
@@ -1343,6 +1543,7 @@ function DashboardPage({
 
 function JobPage({
   analysisBusyId,
+  isDemoMode,
   jobError,
   jobs,
   messageBusyId,
@@ -1424,6 +1625,18 @@ function JobPage({
     setChatInput("");
   }
 
+  async function handleChatKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+    event.preventDefault();
+    if (!chatInput.trim() || isMessagingCurrentJob) {
+      return;
+    }
+    await onSendMessage(currentJob, chatInput);
+    setChatInput("");
+  }
+
   return (
     <>
       <header className="topbar">
@@ -1456,6 +1669,11 @@ function JobPage({
             <div>
               <p className="eyebrow">Job chat</p>
               <h2>{currentJob.company} workspace</h2>
+              {isDemoMode ? (
+                <p className="mode-note compact">
+                  Demo mode uses scripted sample data. Live AI chat works only after normal login.
+                </p>
+              ) : null}
             </div>
             <span className={`status-pill ${currentJob.status}`}>{currentJob.status}</span>
           </div>
@@ -1488,13 +1706,15 @@ function JobPage({
           <form className="chat-form" onSubmit={submitChat}>
             <textarea
               onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={(event) => void handleChatKeyDown(event)}
               placeholder="Try: I applied today, Recruiter is Anna Smith, Follow up in 3 days..."
               rows={4}
               value={chatInput}
             />
             <div className="chat-form-footer">
               <p className="muted-text">
-                This assistant is scoped only to {currentJob.company} and its workspace data.
+                Enter to send. Shift+Enter for a new line. This assistant is scoped only to{" "}
+                {currentJob.company} and its workspace data.
               </p>
               <button className="primary-button" disabled={isMessagingCurrentJob} type="submit">
                 {isMessagingCurrentJob ? "Updating..." : "Send message"}

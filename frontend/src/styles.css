@@ -149,6 +149,26 @@ a {
   font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
 }
 
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.mode-badge.demo {
+  background: rgba(255, 180, 173, 0.14);
+  color: #ffb4ad;
+}
+
+.mode-badge.live {
+  background: rgba(197, 255, 223, 0.14);
+  color: #c5ffdf;
+}
+
 .auth-form label,
 .job-form label {
   display: grid;
@@ -369,6 +389,30 @@ a {
   display: grid;
   gap: 14px;
   margin-top: 20px;
+}
+
+.mode-note {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 180, 173, 0.22);
+  background: rgba(255, 180, 173, 0.08);
+  color: rgba(246, 241, 232, 0.88);
+}
+
+.mode-note.compact {
+  margin: 10px 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 180, 173, 0.88);
+  font-size: 0.92rem;
+}
+
+.job-form-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .two-column-grid,
