@@ -48,6 +48,35 @@ KEYWORDS = [
     "Communication",
 ]
 
+REQUIREMENT_ALIASES: dict[str, set[str]] = {
+    "React": {"react", "react.js", "reactjs"},
+    "TypeScript": {"typescript", "ts"},
+    "JavaScript": {"javascript", "js", "ecmascript"},
+    "Node.js": {"node", "node.js", "nodejs"},
+    "Express.js": {"express", "express.js", "expressjs"},
+    "Python": {"python"},
+    "FastAPI": {"fastapi"},
+    "PostgreSQL": {"postgres", "postgresql"},
+    "Supabase": {"supabase"},
+    "Docker": {"docker", "containers", "containerization"},
+    "GraphQL": {"graphql"},
+    "REST": {"rest", "rest api", "restful", "restful api"},
+    "API": {"api", "apis", "integrations", "integration"},
+    "Cloud": {"cloud", "aws", "gcp", "azure"},
+    "Communication": {"communication", "stakeholder", "collaboration", "cross-functional"},
+    "Product Thinking": {"product thinking", "product mindset", "customer empathy", "product"},
+    "Frontend Architecture": {"frontend architecture", "design systems", "component architecture"},
+    "UX": {"ux", "user experience", "interaction design"},
+}
+
+ROLE_FAMILIES: dict[str, set[str]] = {
+    "frontend": {"frontend", "react", "ui", "web", "client"},
+    "backend": {"backend", "api", "server", "python", "node", "integrations"},
+    "full-stack": {"full stack", "full-stack", "frontend", "backend"},
+    "product": {"product", "pm", "manager"},
+    "data": {"data", "analytics", "bi", "sql"},
+}
+
 NOISY_TITLE_SUFFIXES = [
     " | linkedin",
     " | indeed",
@@ -75,6 +104,10 @@ def _normalize(text: str) -> str:
     return text.strip().lower()
 
 
+def _normalize_token(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _normalize(text)).strip()
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -96,6 +129,111 @@ def _infer_requirements(text: str) -> list[str]:
     if detected:
         return detected
     return ["Communication", "Execution", "Product Thinking"]
+
+
+def _collect_profile_terms(profile: UserProfilePayload) -> set[str]:
+    terms: set[str] = set()
+    for skill in profile.skills:
+        terms.add(_normalize_token(skill.name))
+        for canonical, aliases in REQUIREMENT_ALIASES.items():
+            if _normalize_token(skill.name) == _normalize_token(canonical) or _normalize_token(skill.name) in aliases:
+                terms.update(aliases)
+                terms.add(_normalize_token(canonical))
+
+    for item in profile.tech_stack:
+        terms.add(_normalize_token(item))
+        for canonical, aliases in REQUIREMENT_ALIASES.items():
+            if _normalize_token(item) == _normalize_token(canonical) or _normalize_token(item) in aliases:
+                terms.update(aliases)
+                terms.add(_normalize_token(canonical))
+
+    return {term for term in terms if term}
+
+
+def _canonicalize_requirement(requirement: str) -> str:
+    normalized = _normalize_token(requirement)
+    for canonical, aliases in REQUIREMENT_ALIASES.items():
+        if normalized == _normalize_token(canonical) or normalized in aliases:
+            return canonical
+    return requirement.strip()
+
+
+def _requirement_match_kind(requirement: str, profile_terms: set[str]) -> str:
+    normalized = _normalize_token(requirement)
+    canonical = _canonicalize_requirement(requirement)
+    canonical_normalized = _normalize_token(canonical)
+    aliases = REQUIREMENT_ALIASES.get(canonical, {canonical_normalized})
+
+    if normalized in profile_terms or canonical_normalized in profile_terms:
+        return "direct"
+    if aliases & profile_terms:
+        return "direct"
+    if canonical == "API" and any(term in profile_terms for term in {"fastapi", "rest", "rest api", "graphql"}):
+        return "transferable"
+    if canonical == "Communication":
+        return "soft"
+    if canonical == "Product Thinking":
+        return "soft"
+    if canonical == "Cloud" and any(term in profile_terms for term in {"docker", "postgresql", "supabase"}):
+        return "transferable"
+    return "missing"
+
+
+def _role_family(text: str) -> str | None:
+    lowered = _normalize(text)
+    for family, markers in ROLE_FAMILIES.items():
+        if any(marker in lowered for marker in markers):
+            return family
+    return None
+
+
+def _profile_role_families(profile: UserProfilePayload) -> set[str]:
+    families = {_role_family(role) for role in profile.preferred_roles}
+    families.update({_role_family(skill.name) for skill in profile.skills})
+    families.update({_role_family(item) for item in profile.tech_stack})
+    return {family for family in families if family}
+
+
+def _workspace_role_family(workspace: AnalyzeJobRequest | object) -> str | None:
+    candidate = workspace.workspace if hasattr(workspace, "workspace") else workspace
+    combined = f"{getattr(candidate, 'title', '')} {getattr(candidate, 'job_description', '')}"
+    return _role_family(combined)
+
+
+def _analysis_summary(
+    recommendation: str,
+    seniority_fit: str,
+    direct_matches: list[str],
+    transferable_matches: list[str],
+    missing: list[str],
+) -> str:
+    if recommendation == "apply":
+        if direct_matches:
+            return (
+                f"Strong fit overall. Your best overlap is in {', '.join(direct_matches[:2])}, "
+                f"and the role looks {seniority_fit} for your current profile."
+            )
+        return "Strong overall fit with enough relevant overlap to justify applying."
+
+    if recommendation == "consider":
+        if missing:
+            return (
+                f"There is real overlap here, but you should be ready to address gaps around "
+                f"{', '.join(missing[:2])} before applying."
+            )
+        if transferable_matches:
+            return (
+                f"This role is viable mostly on transferable overlap such as {', '.join(transferable_matches[:2])}. "
+                "It may still be worth applying if the team is flexible."
+            )
+        return "There is some overlap, but this role still needs a closer manual review before you invest more time."
+
+    if missing:
+        return (
+            f"The fit is weak right now because several core requirements are still missing, especially "
+            f"{', '.join(missing[:2])}."
+        )
+    return "The fit looks weak right now and probably is not the best use of your application time."
 
 
 def _message(role: str, content: str, created_at: datetime | None = None) -> JobMessagePayload:
@@ -661,24 +799,44 @@ def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
     requirements = workspace.extracted_requirements or _infer_requirements(
         f"{workspace.title} {workspace.notes} {workspace.job_description}"
     )
-    skill_names = {_normalize(skill.name) for skill in profile.skills}
-    stack_names = {_normalize(item) for item in profile.tech_stack}
+    profile_terms = _collect_profile_terms(profile)
 
-    matched = [
-        requirement
-        for requirement in requirements
-        if _normalize(requirement) in skill_names or _normalize(requirement) in stack_names
-    ]
-    missing = [requirement for requirement in requirements if requirement not in matched]
+    direct_matches: list[str] = []
+    transferable_matches: list[str] = []
+    soft_matches: list[str] = []
+    missing: list[str] = []
 
-    strong_role_fit = any(
-        _normalize(role.split(" ")[0]) in _normalize(workspace.title) for role in profile.preferred_roles
-    )
+    for requirement in requirements:
+        canonical = _canonicalize_requirement(requirement)
+        match_kind = _requirement_match_kind(canonical, profile_terms)
+        if match_kind == "direct":
+            if canonical not in direct_matches:
+                direct_matches.append(canonical)
+        elif match_kind == "transferable":
+            if canonical not in transferable_matches:
+                transferable_matches.append(canonical)
+        elif match_kind == "soft":
+            if canonical not in soft_matches:
+                soft_matches.append(canonical)
+        else:
+            if canonical not in missing:
+                missing.append(canonical)
 
-    score = 52 + len(matched) * 9 + (8 if strong_role_fit else 0)
+    profile_role_families = _profile_role_families(profile)
+    workspace_family = _workspace_role_family(workspace)
+    strong_role_fit = workspace_family in profile_role_families if workspace_family else False
+
+    score = 34
+    score += len(direct_matches) * 13
+    score += len(transferable_matches) * 7
+    score += len(soft_matches) * 2
     score += min(profile.years_of_experience * 3, 12)
-    score -= min(len(missing) * 4, 20)
-    score = max(28, min(94, score))
+    if strong_role_fit:
+        score += 10
+    if workspace_family == "full-stack" and profile_role_families & {"frontend", "backend"}:
+        score += 5
+    score -= min(len(missing) * 5, 25)
+    score = max(25, min(96, score))
 
     seniority_fit = "good fit"
     if profile.years_of_experience <= 1 and re.search(r"senior|lead", workspace.title, re.I):
@@ -687,23 +845,26 @@ def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
         seniority_fit = "too senior"
 
     recommendation = "skip"
-    if score >= 75:
+    if seniority_fit == "too junior":
+        recommendation = "skip"
+    elif score >= 76:
         recommendation = "apply"
     elif score >= 55:
         recommendation = "consider"
 
     analysis = JobAnalysisPayload(
         match_score=score,
-        strengths=matched or ["Transferable engineering foundation"],
+        strengths=(direct_matches + transferable_matches + soft_matches)[:4]
+        or ["Transferable engineering foundation"],
         missing_skills=missing or ["No obvious critical gaps"],
         seniority_fit=seniority_fit,
         recommendation=recommendation,
-        summary=(
-            "Strong overlap between the role and your current profile."
-            if recommendation == "apply"
-            else "There is meaningful overlap, but you should review the key gaps before applying."
-            if recommendation == "consider"
-            else "The fit looks weaker right now because too many core requirements are still missing."
+        summary=_analysis_summary(
+            recommendation,
+            seniority_fit,
+            direct_matches,
+            transferable_matches,
+            missing,
         ),
     )
 
