@@ -236,6 +236,59 @@ def _analysis_summary(
     return "The fit looks weak right now and probably is not the best use of your application time."
 
 
+def _job_requirements_preview(workspace: AnalyzeJobRequest | ChatJobRequest | object) -> list[str]:
+    candidate = workspace.workspace if hasattr(workspace, "workspace") else workspace
+    requirements = getattr(candidate, "extracted_requirements", None) or _infer_requirements(
+        f"{getattr(candidate, 'title', '')} {getattr(candidate, 'job_description', '')} {getattr(candidate, 'notes', '')}"
+    )
+    return [_canonicalize_requirement(item) for item in requirements][:8]
+
+
+def _job_summary_text(workspace: AnalyzeJobRequest | ChatJobRequest | object) -> str:
+    candidate = workspace.workspace if hasattr(workspace, "workspace") else workspace
+    base = getattr(candidate, "job_description", "") or getattr(candidate, "notes", "") or ""
+    cleaned = re.sub(r"\s+", " ", base).strip()
+    if not cleaned:
+        return f"{getattr(candidate, 'title', 'This role')} at {getattr(candidate, 'company', 'the company')}."
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    return " ".join(sentences[:2])[:320]
+
+
+def _recruiter_questions(workspace: AnalyzeJobRequest | ChatJobRequest | object, analysis: JobAnalysisPayload | None) -> str:
+    requirements = _job_requirements_preview(workspace)
+    missing = analysis.missing_skills[:2] if analysis else requirements[:2]
+    prompts = [
+        "What does success look like in the first 90 days for this role?",
+        f"Which of these areas matter most in practice: {', '.join(requirements[:3]) or 'the core stack'}?",
+        f"How flexible is the team around experience gaps in {', '.join(missing) or 'adjacent skills'}?",
+    ]
+    return "\n".join(f"- {item}" for item in prompts)
+
+
+def _should_apply_response(workspace: JobWorkspacePayload, analysis: JobAnalysisPayload | None) -> str:
+    if analysis:
+        if analysis.recommendation == "apply":
+            return (
+                f"I would apply. Your strongest overlap is in {', '.join(analysis.strengths[:2])}, "
+                f"and the role looks {analysis.seniority_fit} for you."
+            )
+        if analysis.recommendation == "consider":
+            return (
+                f"I'd call this a selective apply. There is enough overlap to justify a shot, "
+                f"but you should be ready to explain gaps around {', '.join(analysis.missing_skills[:2])}."
+            )
+        return (
+            f"I would probably skip this one unless you have extra context not captured here. "
+            f"The main issue is the gap around {', '.join(analysis.missing_skills[:2])}."
+        )
+
+    requirements = _job_requirements_preview(workspace)
+    return (
+        f"I'd review it manually before deciding. The role seems to lean on {', '.join(requirements[:3])}, "
+        "but I do not have a full fit analysis yet."
+    )
+
+
 def _message(role: str, content: str, created_at: datetime | None = None) -> JobMessagePayload:
     timestamp = created_at or _now()
     return JobMessagePayload(
@@ -553,6 +606,23 @@ def _sanitize_notes_append(note_text: str | None, metadata_patch: JobMetadataPay
 
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,.;\n")
     return cleaned or None
+
+
+def _should_use_deterministic_chat(message: str) -> bool:
+    lower = message.lower().strip()
+    deterministic_patterns = [
+        r"recruiter is ",
+        r"(?:contact person|contact) is ",
+        r"(?:change|set)\s+company",
+        r"(?:change|set)\s+source",
+        r"(?:change|set)\s+(?:job )?(?:title|position)",
+        r"i applied today",
+        r"applied (?:for )?(?:this job )?yesterday",
+        r"follow up in \d+ day",
+        r"follow up .*?(?:in|after) (?:a )?week",
+        r"note[:\-]?",
+    ]
+    return any(re.search(pattern, lower) for pattern in deterministic_patterns)
 
 
 def _looks_like_company_or_search_page(job_url: str) -> bool:
@@ -895,12 +965,35 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
             provider_mode="fallback",
         )
 
+    contact_match = re.search(r"(?:contact person|contact) is (.+)", message, re.I)
+    if contact_match:
+        contact_name = contact_match.group(1).strip()
+        metadata_patch.contact_person = contact_name
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                f"Saved. {contact_name} is now stored as the contact person for this application.",
+            ),
+            metadata_patch=metadata_patch,
+            provider_mode="fallback",
+        )
+
     company_match = re.search(r"(?:change|set)\s+company(?:\s+name)?\s+to\s+(.+)", message, re.I)
     if company_match:
         company_name = company_match.group(1).strip()
         workspace_patch.company = company_name
         return ChatJobResponse(
             assistant_message=_message("assistant", f"Saved. I updated the company name to {company_name}."),
+            workspace_patch=workspace_patch,
+            provider_mode="fallback",
+        )
+
+    title_match = re.search(r"(?:change|set)\s+(?:job )?(?:title|position(?: title)?)\s+to\s+(.+)", message, re.I)
+    if title_match:
+        title = title_match.group(1).strip()
+        workspace_patch.title = title
+        return ChatJobResponse(
+            assistant_message=_message("assistant", f"Saved. I updated the position title to {title}."),
             workspace_patch=workspace_patch,
             provider_mode="fallback",
         )
@@ -928,10 +1021,34 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
             provider_mode="fallback",
         )
 
+    if re.search(r"applied (?:for )?(?:this job )?yesterday", lower):
+        metadata_patch.application_date = (_now() - timedelta(days=1)).date().isoformat()
+        status_patch = JobStatus.APPLIED
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                "Saved. I marked this role as applied and set the application date to yesterday.",
+            ),
+            metadata_patch=metadata_patch,
+            status_patch=status_patch,
+            provider_mode="fallback",
+        )
+
     follow_up_days_match = re.search(r"follow up in (\d+) days?", lower)
     if follow_up_days_match:
         days = int(follow_up_days_match.group(1))
         metadata_patch.follow_up_date = _days_from_now(days)
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                f"Done. I set the follow-up date to {_format_date(metadata_patch.follow_up_date)}.",
+            ),
+            metadata_patch=metadata_patch,
+            provider_mode="fallback",
+        )
+
+    if re.search(r"follow up .*?(?:in|after) (?:a )?week", lower):
+        metadata_patch.follow_up_date = _days_from_now(7)
         return ChatJobResponse(
             assistant_message=_message(
                 "assistant",
@@ -956,10 +1073,23 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
             provider_mode="fallback",
         )
 
-    if "requirement" in lower or "requirements" in lower:
-        requirements = payload.workspace.extracted_requirements or _infer_requirements(
-            f"{payload.workspace.title} {payload.workspace.job_description} {payload.workspace.notes}"
+    if "what can you do" in lower or "how can you help" in lower:
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                "I can summarize the role, explain key requirements, tell you whether this looks worth applying to, update structured fields like recruiter or follow-up date, and suggest what to ask the recruiter next.",
+            ),
+            provider_mode="fallback",
         )
+
+    if "summarize" in lower and "role" in lower:
+        return ChatJobResponse(
+            assistant_message=_message("assistant", _job_summary_text(payload.workspace)),
+            provider_mode="fallback",
+        )
+
+    if "requirement" in lower or "requirements" in lower:
+        requirements = _job_requirements_preview(payload.workspace)
         preview = ", ".join(requirements[:8]) if requirements else "No clear requirements extracted yet."
         return ChatJobResponse(
             assistant_message=_message(
@@ -970,6 +1100,24 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
         )
 
     analysis = payload.workspace.analysis
+    if "should i apply" in lower or "worth applying" in lower:
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                _should_apply_response(payload.workspace, analysis),
+            ),
+            provider_mode="fallback",
+        )
+
+    if "what should i ask" in lower and "recruiter" in lower:
+        return ChatJobResponse(
+            assistant_message=_message(
+                "assistant",
+                _recruiter_questions(payload.workspace, analysis),
+            ),
+            provider_mode="fallback",
+        )
+
     if analysis:
         content = (
             f"For {payload.workspace.company}, your strongest fit is {analysis.strengths[0]}. "
@@ -1121,6 +1269,8 @@ def analyze_job_with_optional_llm(payload: AnalyzeJobRequest) -> AnalyzeJobRespo
 
 def chat_job_with_optional_llm(payload: ChatJobRequest) -> ChatJobResponse:
     fallback = chat_job_fallback(payload)
+    if _should_use_deterministic_chat(payload.message):
+        return fallback
     response_text = _anthropic_request(
         system_prompt=(
             "You are a job-specific assistant for one job workspace. "
@@ -1128,6 +1278,7 @@ def chat_job_with_optional_llm(payload: ChatJobRequest) -> ChatJobResponse:
             "Prefer plain text in a short paragraph or 3-5 short bullets. "
             "Avoid markdown headings, tables, bold formatting, and emoji unless the user asks. "
             "When the user asks about requirements, skills, fit, or next steps, answer directly from the workspace data. "
+            "You should also be useful for questions like whether to apply, how to summarize the role, and what to ask the recruiter. "
             "If the user also updates structured data like recruiter, application date, follow-up date, notes, or status, "
             "put recruiter/contact, source, dates, and summary fields into metadata_patch. "
             "Put company, title, job_description, and extracted_requirements corrections into workspace_patch. "
