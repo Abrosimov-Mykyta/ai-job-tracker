@@ -40,13 +40,21 @@ export type UserSkill = {
 };
 
 export type UserProfile = {
+  headline: string;
+  summary: string;
   preferred_roles: string[];
+  target_seniority: string;
   tech_stack: string[];
   skills: UserSkill[];
   years_of_experience: number;
   english_level: string;
   location: string;
+  preferred_locations: string[];
   work_format: "remote" | "hybrid" | "office";
+  open_to_relocate: boolean;
+  salary_expectation: string;
+  github_url: string;
+  portfolio_url: string;
 };
 
 export type JobAnalysis = {
@@ -71,4 +79,11 @@ export type JobMessage = {
   role: MessageRole;
   content: string;
   created_at: string;
+  attachment_names?: string[];
+};
+
+export type ChatAttachment = {
+  file_name: string;
+  media_type: string;
+  data_base64: string;
 };

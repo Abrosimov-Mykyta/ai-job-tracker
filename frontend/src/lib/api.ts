@@ -1,4 +1,11 @@
-import type { AuthResponse, Job, JobMessage, JobMetadata, UserProfile } from "../types";
+import type {
+  AuthResponse,
+  ChatAttachment,
+  Job,
+  JobMessage,
+  JobMetadata,
+  UserProfile
+} from "../types";
 
 const API_BASE_URL = "http://localhost:8000/api";
 
@@ -33,7 +40,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 function normalizeMessage(message: JobMessage, index: number): JobMessage {
   return {
     ...message,
-    id: message.id || `${message.role}-${message.created_at || Date.now()}-${index}`
+    id: message.id || `${message.role}-${message.created_at || Date.now()}-${index}`,
+    attachment_names: message.attachment_names ?? []
   };
 }
 
@@ -135,7 +143,7 @@ export function analyzeJobWithAi(
 
 export function chatJobWithAi(
   token: string,
-  payload: { profile: UserProfile; workspace: Job; message: string }
+  payload: { profile: UserProfile; workspace: Job; message: string; attachments?: ChatAttachment[] }
 ): Promise<{
   assistant_message: JobMessage;
   metadata_patch: JobMetadata | null;
@@ -159,4 +167,15 @@ export function chatJobWithAi(
     ...result,
     assistant_message: normalizeMessage(result.assistant_message, 0)
   }));
+}
+
+export function importProfileWithAi(
+  token: string,
+  payload: { profile: UserProfile; github_url?: string; attachments?: ChatAttachment[] }
+): Promise<{
+  profile: UserProfile;
+  summary: string;
+  provider_mode: "fallback" | "llm";
+}> {
+  return request("/ai/profile-import", { method: "POST", token, body: payload });
 }

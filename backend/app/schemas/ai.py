@@ -13,13 +13,21 @@ class UserSkillPayload(BaseModel):
 
 
 class UserProfilePayload(BaseModel):
+    headline: str = Field(default="", max_length=255)
+    summary: str = Field(default="", max_length=4000)
     preferred_roles: list[str] = Field(default_factory=list)
+    target_seniority: str = Field(default="", max_length=80)
     tech_stack: list[str] = Field(default_factory=list)
     skills: list[UserSkillPayload] = Field(default_factory=list)
     years_of_experience: int = Field(ge=0, le=50)
     english_level: str = Field(default="B2", max_length=50)
     location: str = Field(default="Remote", max_length=120)
+    preferred_locations: list[str] = Field(default_factory=list)
     work_format: Literal["remote", "hybrid", "office"] = "remote"
+    open_to_relocate: bool = False
+    salary_expectation: str = Field(default="", max_length=120)
+    github_url: str = Field(default="", max_length=255)
+    portfolio_url: str = Field(default="", max_length=255)
 
 
 class JobMetadataPayload(BaseModel):
@@ -35,6 +43,13 @@ class JobMessagePayload(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=12000)
     created_at: datetime | None = None
+    attachment_names: list[str] = Field(default_factory=list)
+
+
+class ChatAttachmentPayload(BaseModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    media_type: str = Field(min_length=1, max_length=120)
+    data_base64: str = Field(min_length=1, max_length=20_000_000)
 
 
 class JobAnalysisPayload(BaseModel):
@@ -96,6 +111,7 @@ class ChatJobRequest(BaseModel):
     profile: UserProfilePayload
     workspace: JobWorkspacePayload
     message: str = Field(min_length=1, max_length=12000)
+    attachments: list[ChatAttachmentPayload] = Field(default_factory=list)
 
 
 class ChatJobResponse(BaseModel):
@@ -104,4 +120,16 @@ class ChatJobResponse(BaseModel):
     workspace_patch: WorkspacePatchPayload | None = None
     notes_append: str | None = None
     status_patch: JobStatus | None = None
+    provider_mode: Literal["fallback", "llm"]
+
+
+class ProfileImportRequest(BaseModel):
+    profile: UserProfilePayload
+    github_url: HttpUrl | None = None
+    attachments: list[ChatAttachmentPayload] = Field(default_factory=list)
+
+
+class ProfileImportResponse(BaseModel):
+    profile: UserProfilePayload
+    summary: str
     provider_mode: Literal["fallback", "llm"]

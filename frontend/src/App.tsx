@@ -1,11 +1,14 @@
 import {
+  type ChangeEvent,
   FormEvent,
+  Fragment,
   type KeyboardEvent,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
   useEffect,
   useMemo,
+  useRef,
   useState
 } from "react";
 import {
@@ -23,6 +26,7 @@ import {
   createJob,
   deleteJob,
   fetchJobs,
+  importProfileWithAi,
   login,
   parseJobWithAi,
   register,
@@ -31,6 +35,7 @@ import {
 import type {
   AuthFormMode,
   AuthResponse,
+  ChatAttachment,
   Job,
   JobAnalysis,
   JobMessage,
@@ -46,6 +51,8 @@ const USER_KEY = "ai-job-tracker-user";
 const DEMO_JOBS_KEY = "ai-job-tracker-demo-jobs";
 const DEMO_PROFILE_KEY = "ai-job-tracker-demo-profile";
 const DEMO_TOKEN = "demo-token";
+const MAX_CHAT_ATTACHMENTS = 4;
+const MAX_ATTACHMENT_SIZE_BYTES = 5 * 1024 * 1024;
 
 const initialJobForm = {
   company: "",
@@ -66,14 +73,17 @@ type DashboardPageProps = {
   jobs: Job[];
   savedJobs: Job[];
   appliedJobs: Job[];
-  profile: UserProfile;
+  onOpenCreateJob: () => void;
+};
+
+type ProfilePageProps = {
+  isDemoMode: boolean;
+  profileDraft: UserProfile;
   profileMessage: string;
-  formState: typeof initialJobForm;
-  importBusy: boolean;
-  setFormState: Dispatch<SetStateAction<typeof initialJobForm>>;
-  onCreateJob: (event: FormEvent<HTMLFormElement>) => Promise<void>;
-  onImportJob: () => Promise<void>;
-  onSaveProfile: (event: FormEvent<HTMLFormElement>) => void;
+  profileImportBusy: boolean;
+  onProfileDraftChange: Dispatch<SetStateAction<UserProfile>>;
+  onSaveProfile: () => void;
+  onImportProfile: (attachments: ChatAttachment[]) => Promise<void>;
 };
 
 type JobPageProps = {
@@ -85,7 +95,7 @@ type JobPageProps = {
   profile: UserProfile;
   onAnalyzeJob: (job: Job) => Promise<void>;
   onDeleteJob: (jobId: number) => Promise<void>;
-  onSendMessage: (job: Job, message: string) => Promise<void>;
+  onSendMessage: (job: Job, message: string, attachments?: ChatAttachment[]) => Promise<void>;
   onStatusChange: (job: Job, status: JobStatus) => Promise<void>;
   onSaveJob: (jobId: number, payload: Partial<JobEditableFields>) => Promise<void>;
 };
@@ -98,6 +108,19 @@ type AppShellProps = {
   isDemoMode: boolean;
   onLogout: () => void;
   children: ReactNode;
+};
+
+type CreateJobModalProps = {
+  isDemoMode: boolean;
+  visible: boolean;
+  jobError: string;
+  jobFormMessage: string;
+  formState: typeof initialJobForm;
+  importBusy: boolean;
+  onClose: () => void;
+  onCreateJob: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  onImportJob: () => Promise<void>;
+  setFormState: Dispatch<SetStateAction<typeof initialJobForm>>;
 };
 
 type JobEditableFields = Pick<Job, "company" | "title" | "link" | "notes">;
@@ -118,7 +141,11 @@ const demoUser: User = {
 };
 
 const demoProfileSeed: UserProfile = {
+  headline: "Product-minded frontend engineer building polished web apps",
+  summary:
+    "Frontend-leaning engineer with product instincts, strong React execution, and growing backend confidence in Python and FastAPI. Best in remote teams where shipping quality UI and structured systems both matter.",
   preferred_roles: ["Frontend Engineer", "Full-Stack Engineer", "Product Engineer"],
+  target_seniority: "Middle",
   tech_stack: ["React", "TypeScript", "FastAPI", "PostgreSQL", "Tailwind CSS"],
   skills: [
     { name: "React", level: "advanced", years: 3 },
@@ -131,15 +158,26 @@ const demoProfileSeed: UserProfile = {
   years_of_experience: 3,
   english_level: "B2",
   location: "Europe",
-  work_format: "remote"
+  preferred_locations: ["Portugal", "Remote Europe"],
+  work_format: "remote",
+  open_to_relocate: false,
+  salary_expectation: "€2,500+ net",
+  github_url: "",
+  portfolio_url: ""
 };
 
-function createMessage(role: JobMessage["role"], content: string, createdAt?: string): JobMessage {
+function createMessage(
+  role: JobMessage["role"],
+  content: string,
+  createdAt?: string,
+  attachmentNames?: string[]
+): JobMessage {
   return {
     id: `${role}-${createdAt ?? new Date().toISOString()}-${Math.random().toString(36).slice(2, 8)}`,
     role,
     content,
-    created_at: createdAt ?? new Date().toISOString()
+    created_at: createdAt ?? new Date().toISOString(),
+    attachment_names: attachmentNames ?? []
   };
 }
 
@@ -264,14 +302,60 @@ function saveDemoJobs(jobs: Job[]) {
 function getDemoProfile(): UserProfile {
   const stored = localStorage.getItem(DEMO_PROFILE_KEY);
   if (stored) {
-    return JSON.parse(stored) as UserProfile;
+    const normalized = normalizeProfile(JSON.parse(stored) as Partial<UserProfile>);
+    localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(normalized));
+    return normalized;
   }
   localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(demoProfileSeed));
   return demoProfileSeed;
 }
 
 function saveDemoProfile(profile: UserProfile) {
-  localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(profile));
+  localStorage.setItem(DEMO_PROFILE_KEY, JSON.stringify(normalizeProfile(profile)));
+}
+
+function parseCommaSeparatedList(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function serializeSkills(skills: UserProfile["skills"]): string {
+  return skills.map((skill) => skill.name).join(", ");
+}
+
+function normalizeProfile(input?: Partial<UserProfile> | null): UserProfile {
+  const source = input ?? {};
+  return {
+    headline: source.headline ?? demoProfileSeed.headline,
+    summary: source.summary ?? demoProfileSeed.summary,
+    preferred_roles: Array.isArray(source.preferred_roles)
+      ? source.preferred_roles.filter(Boolean)
+      : demoProfileSeed.preferred_roles,
+    target_seniority: source.target_seniority ?? demoProfileSeed.target_seniority,
+    tech_stack: Array.isArray(source.tech_stack)
+      ? source.tech_stack.filter(Boolean)
+      : demoProfileSeed.tech_stack,
+    skills: Array.isArray(source.skills)
+      ? source.skills.map((skill) => ({
+          name: skill?.name ?? "",
+          level: skill?.level ?? "intermediate",
+          years: Number(skill?.years ?? 1)
+        }))
+      : demoProfileSeed.skills,
+    years_of_experience: Number(source.years_of_experience ?? demoProfileSeed.years_of_experience),
+    english_level: source.english_level ?? demoProfileSeed.english_level,
+    location: source.location ?? demoProfileSeed.location,
+    preferred_locations: Array.isArray(source.preferred_locations)
+      ? source.preferred_locations.filter(Boolean)
+      : demoProfileSeed.preferred_locations,
+    work_format: source.work_format ?? demoProfileSeed.work_format,
+    open_to_relocate: Boolean(source.open_to_relocate ?? demoProfileSeed.open_to_relocate),
+    salary_expectation: source.salary_expectation ?? demoProfileSeed.salary_expectation,
+    github_url: source.github_url ?? demoProfileSeed.github_url,
+    portfolio_url: source.portfolio_url ?? demoProfileSeed.portfolio_url
+  };
 }
 
 function normalizeToken(input: string): string {
@@ -294,6 +378,97 @@ function getLinkSourceLabel(link: string): string {
   } catch {
     return "Manual entry";
   }
+}
+
+function renderFormattedMessage(content: string): ReactNode {
+  const lines = content.split("\n");
+  const blocks: ReactNode[] = [];
+  let listItems: string[] = [];
+
+  function renderInline(text: string, keyPrefix: string): ReactNode[] {
+    const parts = text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean);
+    return parts.map((part, index) => {
+      if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+        return <strong key={`${keyPrefix}-strong-${index}`}>{part.slice(2, -2)}</strong>;
+      }
+      return <Fragment key={`${keyPrefix}-text-${index}`}>{part}</Fragment>;
+    });
+  }
+
+  function flushList(keyPrefix: string) {
+    if (!listItems.length) {
+      return;
+    }
+    blocks.push(
+      <ul key={`${keyPrefix}-list`} className="message-list-block">
+        {listItems.map((item, index) => (
+          <li key={`${keyPrefix}-item-${index}`}>{renderInline(item, `${keyPrefix}-${index}`)}</li>
+        ))}
+      </ul>
+    );
+    listItems = [];
+  }
+
+  lines.forEach((rawLine, index) => {
+    const line = rawLine.trim();
+    const keyPrefix = `block-${index}`;
+
+    if (!line) {
+      flushList(keyPrefix);
+      return;
+    }
+
+    if (line.startsWith("- ") || line.startsWith("* ")) {
+      listItems.push(line.slice(2).trim());
+      return;
+    }
+
+    flushList(keyPrefix);
+
+    const headingMatch = line.match(/^#{1,3}\s+(.+)$/);
+    if (headingMatch) {
+      blocks.push(
+        <p key={`${keyPrefix}-heading`} className="message-heading">
+          {renderInline(headingMatch[1], keyPrefix)}
+        </p>
+      );
+      return;
+    }
+
+    blocks.push(
+      <p key={`${keyPrefix}-paragraph`} className="message-paragraph">
+        {renderInline(line, keyPrefix)}
+      </p>
+    );
+  });
+
+  flushList("final");
+  return blocks;
+}
+
+function isSupportedAttachment(file: File): boolean {
+  return file.type.startsWith("image/") || file.type === "application/pdf";
+}
+
+function fileToAttachment(file: File): Promise<ChatAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string" || !result.includes(",")) {
+        reject(new Error(`Could not read ${file.name}.`));
+        return;
+      }
+      const [, dataBase64] = result.split(",", 2);
+      resolve({
+        file_name: file.name,
+        media_type: file.type || "application/octet-stream",
+        data_base64: dataBase64
+      });
+    };
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.readAsDataURL(file);
+  });
 }
 
 function formatDisplayDate(value?: string): string {
@@ -503,16 +678,22 @@ function App() {
     };
   });
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [profile, setProfile] = useState<UserProfile>(getDemoProfile);
+  const [profile, setProfile] = useState<UserProfile>(() => normalizeProfile(getDemoProfile()));
+  const [profileDraft, setProfileDraft] = useState<UserProfile>(() =>
+    normalizeProfile(getDemoProfile())
+  );
   const [authError, setAuthError] = useState("");
   const [jobError, setJobError] = useState("");
   const [profileMessage, setProfileMessage] = useState("");
+  const [jobFormMessage, setJobFormMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [analysisBusyId, setAnalysisBusyId] = useState<number | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  const [profileImportBusy, setProfileImportBusy] = useState(false);
   const [messageBusyId, setMessageBusyId] = useState<number | null>(null);
   const [formState, setFormState] = useState(initialJobForm);
   const [importDraft, setImportDraft] = useState<ImportedJobDraft | null>(null);
+  const [isCreateJobModalOpen, setIsCreateJobModalOpen] = useState(false);
 
   const savedJobs = useMemo(() => jobs.filter((job) => job.status === "saved"), [jobs]);
   const appliedJobs = useMemo(() => jobs.filter((job) => job.status === "applied"), [jobs]);
@@ -530,8 +711,10 @@ function App() {
       setLoading(true);
       setJobError("");
       if (isDemoSession(nextToken)) {
+        const demoProfile = normalizeProfile(getDemoProfile());
         setJobs(getDemoJobs());
-        setProfile(getDemoProfile());
+        setProfile(demoProfile);
+        setProfileDraft(demoProfile);
         setProfileMessage("");
         return;
       }
@@ -583,6 +766,7 @@ function App() {
 
     try {
       setJobError("");
+      setJobFormMessage("");
       if (isDemoSession(session.token)) {
         const now = new Date().toISOString();
         const metadata: JobMetadata = {
@@ -626,6 +810,8 @@ function App() {
         });
         setFormState(initialJobForm);
         setImportDraft(null);
+        setIsCreateJobModalOpen(false);
+        setJobFormMessage("Demo job added to the pipeline.");
         return;
       }
 
@@ -661,6 +847,8 @@ function App() {
       setJobs((currentJobs) => [createdJob, ...currentJobs]);
       setFormState(initialJobForm);
       setImportDraft(null);
+      setIsCreateJobModalOpen(false);
+      setJobFormMessage("Job workspace created.");
     } catch (error) {
       setJobError(error instanceof Error ? error.message : "Could not create job.");
     }
@@ -674,6 +862,7 @@ function App() {
 
     setImportBusy(true);
     setJobError("");
+    setJobFormMessage("");
 
     try {
       if (isDemoSession(session.token)) {
@@ -706,6 +895,7 @@ function App() {
             notes_summary: "Imported from job link."
           }
         });
+        setJobFormMessage("Demo import filled the draft with placeholder job details.");
         return;
       }
 
@@ -722,7 +912,7 @@ function App() {
         link: parsed.link,
         notes: parsed.job_description
       }));
-      setProfileMessage(
+      setJobFormMessage(
         parsed.parser_mode === "llm"
           ? "Job link parsed with live AI."
           : "Job link parsed in fallback mode. Review fields before saving."
@@ -868,26 +1058,30 @@ function App() {
     }
   }
 
-  async function handleSendMessage(job: Job, message: string) {
+  async function handleSendMessage(job: Job, message: string, attachments: ChatAttachment[] = []) {
     if (!session.token) {
       return;
     }
 
     const trimmed = message.trim();
-    if (!trimmed) {
+    if (!trimmed && !attachments.length) {
       return;
     }
+    const attachmentNames = attachments.map((item) => item.file_name);
+    const userContent = trimmed || "Attached file for this job workspace.";
 
     setMessageBusyId(job.id);
 
     try {
       if (isDemoSession(session.token)) {
-        const result = buildAssistantReply(job, profile, trimmed);
+        const result = buildAssistantReply(job, profile, trimmed || "Please inspect the attached file.");
         const timestamp = new Date().toISOString();
-        const userMessage = createMessage("user", trimmed, timestamp);
+        const userMessage = createMessage("user", userContent, timestamp, attachmentNames);
         const assistantMessage = createMessage(
           "assistant",
-          result.assistantContent,
+          attachments.length
+            ? "Demo mode cannot inspect screenshots or PDFs yet. Log in normally to use live file analysis."
+            : result.assistantContent,
           new Date(Date.now() + 500).toISOString()
         );
 
@@ -921,7 +1115,7 @@ function App() {
         });
       } else {
         const timestamp = new Date().toISOString();
-        const userMessage = createMessage("user", trimmed, timestamp);
+        const userMessage = createMessage("user", userContent, timestamp, attachmentNames);
         setJobs((currentJobs) =>
           currentJobs.map((item) =>
             item.id === job.id
@@ -934,7 +1128,12 @@ function App() {
           )
         );
 
-        const result = await chatJobWithAi(session.token, { profile, workspace: job, message: trimmed });
+        const result = await chatJobWithAi(session.token, {
+          profile,
+          workspace: job,
+          message: trimmed || "Please inspect the attached file and extract anything important for this job workspace.",
+          attachments
+        });
         const nextMessages = [...(job.messages ?? []), userMessage, result.assistant_message];
         const nextMetadata = result.metadata_patch
           ? { ...(job.metadata ?? {}), ...result.metadata_patch }
@@ -965,37 +1164,46 @@ function App() {
     }
   }
 
-  function handleSaveProfile(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const formData = new FormData(event.currentTarget);
-    const nextProfile: UserProfile = {
-      preferred_roles: String(formData.get("preferred_roles") ?? "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean),
-      tech_stack: String(formData.get("tech_stack") ?? "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean),
-      years_of_experience: Number(formData.get("years_of_experience") ?? 0),
-      english_level: String(formData.get("english_level") ?? "B2"),
-      location: String(formData.get("location") ?? "Europe"),
-      work_format: String(formData.get("work_format") ?? "remote") as UserProfile["work_format"],
-      skills: String(formData.get("skills") ?? "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean)
-        .map((name) => {
-          const existing = profile.skills.find(
-            (skill) => normalizeToken(skill.name) === normalizeToken(name)
-          );
-          return existing ?? { name, level: "intermediate", years: 1 };
-        })
-    };
-
-    setProfile(nextProfile);
-    saveDemoProfile(nextProfile);
+  function handleSaveProfile() {
+    const normalized = normalizeProfile(profileDraft);
+    setProfile(normalized);
+    setProfileDraft(normalized);
+    saveDemoProfile(normalized);
     setProfileMessage("Candidate profile saved.");
+  }
+
+  async function handleImportProfile(attachments: ChatAttachment[]) {
+    if (!session.token) {
+      return;
+    }
+
+    if (isDemoSession(session.token)) {
+      setProfileMessage("Live AI profile import is unavailable in demo mode.");
+      return;
+    }
+
+    if (!profileDraft.github_url.trim() && !attachments.length) {
+      setProfileMessage("Add a GitHub link, upload a CV, or do both before using AI import.");
+      return;
+    }
+
+    try {
+      setProfileImportBusy(true);
+      setProfileMessage("");
+      const result = await importProfileWithAi(session.token, {
+        profile: profileDraft,
+        github_url: profileDraft.github_url.trim() || undefined,
+        attachments
+      });
+      setProfileDraft(normalizeProfile(result.profile));
+      setProfileMessage(result.summary);
+    } catch (error) {
+      setProfileMessage(
+        error instanceof Error ? error.message : "Could not enrich the candidate profile."
+      );
+    } finally {
+      setProfileImportBusy(false);
+    }
   }
 
   function logout() {
@@ -1011,9 +1219,11 @@ function App() {
       user: demoUser
     };
     saveDemoJobs(getDemoJobs());
-    saveDemoProfile(getDemoProfile());
+    const demoProfile = normalizeProfile(getDemoProfile());
+    saveDemoProfile(demoProfile);
     setSession(nextSession);
-    setProfile(getDemoProfile());
+    setProfile(demoProfile);
+    setProfileDraft(demoProfile);
     localStorage.setItem(TOKEN_KEY, DEMO_TOKEN);
     localStorage.setItem(USER_KEY, JSON.stringify(demoUser));
     setAuthError("");
@@ -1054,19 +1264,59 @@ function App() {
               >
                 <DashboardPage
                   appliedJobs={appliedJobs}
-                  formState={formState}
                   isDemoMode={isDemoSession(session.token)}
-                  importBusy={importBusy}
                   jobError={jobError}
                   jobs={jobs}
                   loading={loading}
+                  onOpenCreateJob={() => {
+                    setJobError("");
+                    setJobFormMessage("");
+                    setIsCreateJobModalOpen(true);
+                  }}
+                  savedJobs={savedJobs}
+                />
+                <CreateJobModal
+                  formState={formState}
+                  importBusy={importBusy}
+                  isDemoMode={isDemoSession(session.token)}
+                  jobError={jobError}
+                  jobFormMessage={jobFormMessage}
+                  onClose={() => {
+                    setJobError("");
+                    setJobFormMessage("");
+                    setIsCreateJobModalOpen(false);
+                  }}
                   onCreateJob={handleCreateJob}
                   onImportJob={handleImportJob}
-                  onSaveProfile={handleSaveProfile}
-                  profile={profile}
-                  profileMessage={profileMessage}
-                  savedJobs={savedJobs}
                   setFormState={setFormState}
+                  visible={isCreateJobModalOpen}
+                />
+              </AppShell>
+            ) : (
+              <Navigate replace to="/auth" />
+            )
+          }
+        />
+        <Route
+          path="/profile"
+          element={
+            isAuthenticated && session.user ? (
+              <AppShell
+                appliedJobs={appliedJobs}
+                isDemoMode={isDemoSession(session.token)}
+                jobs={jobs}
+                onLogout={logout}
+                savedJobs={savedJobs}
+                userName={session.user.full_name}
+              >
+                <ProfilePage
+                  isDemoMode={isDemoSession(session.token)}
+                  onImportProfile={handleImportProfile}
+                  onProfileDraftChange={setProfileDraft}
+                  onSaveProfile={handleSaveProfile}
+                  profileDraft={profileDraft}
+                  profileImportBusy={profileImportBusy}
+                  profileMessage={profileMessage}
                 />
               </AppShell>
             ) : (
@@ -1238,6 +1488,12 @@ function AppShell({
           >
             Dashboard
           </NavLink>
+          <NavLink
+            className={({ isActive }) => `nav-link ${isActive ? "active" : ""}`}
+            to="/profile"
+          >
+            Profile
+          </NavLink>
         </nav>
 
         <SidebarSection jobs={appliedJobs} title="Applied" />
@@ -1294,31 +1550,47 @@ function SidebarSection({ jobs, title }: { jobs: Job[]; title: string }) {
 
 function DashboardPage({
   appliedJobs,
-  formState,
   isDemoMode,
-  importBusy,
   jobError,
   jobs,
   loading,
-  onCreateJob,
-  onImportJob,
-  onSaveProfile,
-  profile,
-  profileMessage,
-  savedJobs,
-  setFormState
+  onOpenCreateJob,
+  savedJobs
 }: DashboardPageProps) {
-  const latestAppliedJob = appliedJobs[0];
-  const latestSavedJob = savedJobs[0];
+  const analyzedJobs = jobs.filter((job) => job.analysis);
+  const topMatches = [...analyzedJobs]
+    .sort((left, right) => (right.analysis?.match_score ?? 0) - (left.analysis?.match_score ?? 0))
+    .slice(0, 4);
+  const upcomingFollowUps = jobs
+    .filter((job) => job.metadata?.follow_up_date)
+    .sort((left, right) =>
+      (left.metadata?.follow_up_date ?? "").localeCompare(right.metadata?.follow_up_date ?? "")
+    )
+    .slice(0, 4);
+  const averageMatch = analyzedJobs.length
+    ? Math.round(
+        analyzedJobs.reduce((sum, job) => sum + (job.analysis?.match_score ?? 0), 0) /
+          analyzedJobs.length
+      )
+    : 0;
 
   return (
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">Stage 3 active</p>
-          <h1>Track jobs, score fit, and manage each application as its own workspace</h1>
+          <p className="eyebrow">Overview</p>
+          <h1>Your job search command center</h1>
         </div>
-        <div className="topbar-metrics">
+        <div className="topbar-actions">
+          <button className="primary-button" onClick={onOpenCreateJob} type="button">
+            Create new role
+          </button>
+        </div>
+      </header>
+
+      {jobError ? <p className="error-text dashboard-error">{jobError}</p> : null}
+
+      <section className="topbar-metrics metrics-grid">
           <article>
             <span>Total</span>
             <strong>{jobs.length}</strong>
@@ -1331,213 +1603,575 @@ function DashboardPage({
             <span>Applied</span>
             <strong>{appliedJobs.length}</strong>
           </article>
-        </div>
-      </header>
+          <article>
+            <span>Analyzed</span>
+            <strong>{analyzedJobs.length}</strong>
+          </article>
+          <article>
+            <span>Avg match</span>
+            <strong>{analyzedJobs.length ? `${averageMatch}%` : "--"}</strong>
+          </article>
+      </section>
 
-      <section className="dashboard-grid">
+      <section className="workspace-grid dashboard-overview-grid">
+        <article className="panel workspace-panel spotlight-panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Best matches</p>
+              <h2>Roles worth opening first</h2>
+            </div>
+            {loading ? <span className="status-badge">Loading</span> : null}
+          </div>
+          {topMatches.length ? (
+            <div className="match-preview-list">
+              {topMatches.map((job) => (
+                <NavLink key={job.id} className="match-preview-card" to={`/jobs/${job.id}`}>
+                  <div>
+                    <span>{job.company}</span>
+                    <strong>{job.title}</strong>
+                    <p>{job.analysis?.summary}</p>
+                  </div>
+                  <div className="match-preview-score">
+                    <strong>{job.analysis?.match_score}%</strong>
+                    <span>{job.analysis?.recommendation}</span>
+                  </div>
+                </NavLink>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state-card">
+              <strong>No high-signal matches yet</strong>
+              <p>Run analysis on a few jobs and the strongest opportunities will surface here.</p>
+            </div>
+          )}
+        </article>
+
         <article className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">New job</p>
-              <h2>Add a role manually</h2>
+              <p className="eyebrow">Next actions</p>
+              <h2>Pipeline momentum</h2>
             </div>
           </div>
-          {isDemoMode ? (
-            <p className="mode-note">
-              Demo mode shows seeded data only. Log out and sign in to test real link import and
-              live AI responses.
-            </p>
-          ) : null}
+          <div className="dashboard-actions">
+            <article className="action-card">
+              <span>Needs attention</span>
+              <strong>{savedJobs.length ? savedJobs[0].company : "No saved roles"}</strong>
+              <p>
+                {savedJobs.length
+                  ? `${savedJobs[0].title} is still sitting in saved. Either analyze it or move on.`
+                  : "Save a few jobs and decide which ones deserve a workspace."}
+              </p>
+            </article>
+            <article className="action-card">
+              <span>Follow-ups</span>
+              <strong>{upcomingFollowUps.length}</strong>
+              <p>
+                {upcomingFollowUps.length
+                  ? `The closest reminder is ${formatDisplayDate(
+                      upcomingFollowUps[0].metadata?.follow_up_date
+                    )}.`
+                  : "No follow-up reminders yet. Applied jobs with dates will show here."}
+              </p>
+            </article>
+          </div>
+        </article>
 
-          <form className="job-form" onSubmit={onCreateJob}>
-            <label>
-              Company
-              <input
-                value={formState.company}
-                onChange={(event) =>
-                  setFormState((current) => ({ ...current, company: event.target.value }))
-                }
-                placeholder="Stripe"
-                required
-              />
-            </label>
-            <label>
-              Position title
-              <input
-                value={formState.title}
-                onChange={(event) =>
-                  setFormState((current) => ({ ...current, title: event.target.value }))
-                }
-                placeholder="Frontend Engineer"
-                required
-              />
-            </label>
-            <label>
-              Job link
-              <input
-                value={formState.link}
-                onChange={(event) =>
-                  setFormState((current) => ({ ...current, link: event.target.value }))
-                }
-                placeholder="https://company.com/jobs/123"
-                required
-                type="url"
-              />
-            </label>
-            <label>
-              Job description or notes
-              <textarea
-                value={formState.notes}
-                onChange={(event) =>
-                  setFormState((current) => ({ ...current, notes: event.target.value }))
-                }
-                placeholder="Paste requirements, recruiter context, or why the role matters..."
-                rows={5}
-              />
-            </label>
-            {jobError ? <p className="error-text">{jobError}</p> : null}
-            <div className="job-form-actions">
-              <button className="primary-button" type="submit">
-                Save job
-              </button>
-              <button
-                className="secondary-button"
-                disabled={importBusy || isDemoMode}
-                onClick={() => void onImportJob()}
-                type="button"
-              >
-                {isDemoMode ? "Live import unavailable in demo" : importBusy ? "Importing..." : "Import from link"}
-              </button>
+        <article className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Pipeline snapshot</p>
+              <h2>Where things stand</h2>
             </div>
-          </form>
+          </div>
+          <div className="summary-grid">
+            <article>
+              <span>Saved roles</span>
+              <strong>{savedJobs.length}</strong>
+            </article>
+            <article>
+              <span>Applied roles</span>
+              <strong>{appliedJobs.length}</strong>
+            </article>
+            <article>
+              <span>Follow-up due</span>
+              <strong>{upcomingFollowUps.length}</strong>
+            </article>
+            <article>
+              <span>Live mode</span>
+              <strong>{isDemoMode ? "Demo" : "Connected"}</strong>
+            </article>
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Upcoming reminders</p>
+              <h2>Follow-up queue</h2>
+            </div>
+          </div>
+          {upcomingFollowUps.length ? (
+            <div className="follow-up-list">
+              {upcomingFollowUps.map((job) => (
+                <NavLink key={job.id} className="follow-up-card" to={`/jobs/${job.id}`}>
+                  <strong>{job.company}</strong>
+                  <span>{job.title}</span>
+                  <p>Follow up on {formatDisplayDate(job.metadata?.follow_up_date)}</p>
+                </NavLink>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state-card compact">
+              <strong>No reminders scheduled</strong>
+              <p>Ask the job assistant to set follow-up dates and they’ll appear here.</p>
+            </div>
+          )}
+        </article>
+      </section>
+    </>
+  );
+}
+
+function ProfilePage({
+  isDemoMode,
+  profileDraft,
+  profileMessage,
+  profileImportBusy,
+  onProfileDraftChange,
+  onSaveProfile,
+  onImportProfile
+}: ProfilePageProps) {
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+
+  function updateProfile<K extends keyof UserProfile>(key: K, value: UserProfile[K]) {
+    onProfileDraftChange((current) => ({ ...current, [key]: value }));
+  }
+
+  async function handleAttachmentChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    if (!files.length) {
+      return;
+    }
+
+    const supportedFiles = files.filter(isSupportedAttachment);
+    const oversizedFiles = supportedFiles.filter((file) => file.size > MAX_ATTACHMENT_SIZE_BYTES);
+    const validFiles = supportedFiles
+      .filter((file) => file.size <= MAX_ATTACHMENT_SIZE_BYTES)
+      .slice(0, MAX_CHAT_ATTACHMENTS);
+
+    try {
+      const nextAttachments = await Promise.all(validFiles.map((file) => fileToAttachment(file)));
+      setAttachments(nextAttachments);
+      if (files.length !== supportedFiles.length) {
+        alert("Only images and PDF files are supported for profile import.");
+      }
+      if (oversizedFiles.length) {
+        alert("Each profile attachment must be 5 MB or smaller.");
+      }
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Could not attach the selected file.");
+    }
+  }
+
+  async function handleAiImport() {
+    await onImportProfile(attachments);
+    setAttachments([]);
+    if (attachmentInputRef.current) {
+      attachmentInputRef.current.value = "";
+    }
+  }
+
+  return (
+    <>
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">Candidate profile</p>
+          <h1>Build the profile your AI will match against every role</h1>
+        </div>
+        <div className="topbar-actions">
+          <button className="primary-button" onClick={onSaveProfile} type="button">
+            Save profile
+          </button>
+        </div>
+      </header>
+
+      <section className="dashboard-grid profile-layout">
+        <article className="panel profile-main-panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Identity</p>
+              <h2>Professional snapshot</h2>
+            </div>
+          </div>
+
+          <div className="job-form">
+            <label>
+              Headline
+              <input
+                onChange={(event) => updateProfile("headline", event.target.value)}
+                placeholder="Frontend engineer building polished product experiences"
+                value={profileDraft.headline}
+              />
+            </label>
+            <label>
+              Summary
+              <textarea
+                onChange={(event) => updateProfile("summary", event.target.value)}
+                placeholder="Short recruiter-facing summary of your strengths, domain focus, and direction."
+                rows={5}
+                value={profileDraft.summary}
+              />
+            </label>
+          </div>
         </article>
 
         <article className="panel panel-accent">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Candidate profile</p>
-              <h2>Data used for matching and recommendations</h2>
+              <p className="eyebrow">AI autofill</p>
+              <h2>Use CV and GitHub to enrich this profile</h2>
             </div>
           </div>
-          <form className="job-form" onSubmit={onSaveProfile}>
+          {isDemoMode ? (
+            <p className="mode-note">
+              Demo mode cannot read your CV or GitHub. Log in normally to use live profile import.
+            </p>
+          ) : null}
+          <div className="job-form">
+            <label>
+              GitHub URL
+              <input
+                onChange={(event) => updateProfile("github_url", event.target.value)}
+                placeholder="https://github.com/yourname"
+                type="url"
+                value={profileDraft.github_url}
+              />
+            </label>
+            <input
+              ref={attachmentInputRef}
+              accept="image/*,.pdf,application/pdf"
+              className="sr-only"
+              onChange={(event) => void handleAttachmentChange(event)}
+              type="file"
+              multiple
+            />
+            {attachments.length ? (
+              <div className="attachment-chip-row pending">
+                {attachments.map((attachment) => (
+                  <button
+                    key={attachment.file_name}
+                    className="attachment-chip removable"
+                    onClick={() =>
+                      setAttachments((current) =>
+                        current.filter((item) => item.file_name !== attachment.file_name)
+                      )
+                    }
+                    type="button"
+                  >
+                    {attachment.file_name} ×
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            <div className="job-form-actions">
+              <button
+                className="secondary-button"
+                disabled={isDemoMode}
+                onClick={() => attachmentInputRef.current?.click()}
+                type="button"
+              >
+                {isDemoMode ? "Attachments unavailable in demo" : "Upload CV or screenshot"}
+              </button>
+              <button
+                className="primary-button"
+                disabled={isDemoMode || profileImportBusy}
+                onClick={() => void handleAiImport()}
+                type="button"
+              >
+                {profileImportBusy ? "Reading profile..." : "Autofill with AI"}
+              </button>
+            </div>
+            {profileMessage ? <p className="success-text">{profileMessage}</p> : null}
+          </div>
+        </article>
+      </section>
+
+      <section className="workspace-grid profile-sections-grid">
+        <article className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Career targets</p>
+              <h2>Direction and preferences</h2>
+            </div>
+          </div>
+          <div className="job-form">
             <label>
               Preferred roles
               <input
-                defaultValue={profile.preferred_roles.join(", ")}
-                name="preferred_roles"
-                placeholder="Frontend Engineer, Full-Stack Engineer"
-              />
-            </label>
-            <label>
-              Tech stack
-              <input
-                defaultValue={profile.tech_stack.join(", ")}
-                name="tech_stack"
-                placeholder="React, TypeScript, FastAPI"
-              />
-            </label>
-            <label>
-              Skills
-              <textarea
-                defaultValue={profile.skills.map((skill) => skill.name).join(", ")}
-                name="skills"
-                rows={4}
+                onChange={(event) =>
+                  updateProfile("preferred_roles", parseCommaSeparatedList(event.target.value))
+                }
+                placeholder="Frontend Engineer, Product Engineer, Full-Stack Engineer"
+                value={profileDraft.preferred_roles.join(", ")}
               />
             </label>
             <div className="two-column-grid">
               <label>
-                Years of experience
+                Target seniority
                 <input
-                  defaultValue={profile.years_of_experience}
-                  min="0"
-                  name="years_of_experience"
-                  type="number"
+                  onChange={(event) => updateProfile("target_seniority", event.target.value)}
+                  placeholder="Middle"
+                  value={profileDraft.target_seniority}
                 />
               </label>
               <label>
-                English level
-                <input defaultValue={profile.english_level} name="english_level" />
-              </label>
-            </div>
-            <div className="two-column-grid">
-              <label>
-                Location
-                <input defaultValue={profile.location} name="location" />
-              </label>
-              <label>
                 Work format
-                <select defaultValue={profile.work_format} name="work_format">
+                <select
+                  onChange={(event) =>
+                    updateProfile("work_format", event.target.value as UserProfile["work_format"])
+                  }
+                  value={profileDraft.work_format}
+                >
                   <option value="remote">Remote</option>
                   <option value="hybrid">Hybrid</option>
                   <option value="office">Office</option>
                 </select>
               </label>
             </div>
-            <button className="secondary-button" type="submit">
-              Save candidate profile
-            </button>
-            {profileMessage ? <p className="success-text">{profileMessage}</p> : null}
-          </form>
-        </article>
-      </section>
-
-      <section className="workspace-grid">
-        <article className="panel workspace-panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">At a glance</p>
-              <h2>Next actions</h2>
+            <div className="two-column-grid">
+              <label>
+                Current location
+                <input
+                  onChange={(event) => updateProfile("location", event.target.value)}
+                  placeholder="Lisbon, Portugal"
+                  value={profileDraft.location}
+                />
+              </label>
+              <label>
+                Preferred locations
+                <input
+                  onChange={(event) =>
+                    updateProfile("preferred_locations", parseCommaSeparatedList(event.target.value))
+                  }
+                  placeholder="Portugal, EU remote, London"
+                  value={profileDraft.preferred_locations.join(", ")}
+                />
+              </label>
             </div>
-            {loading ? <span className="status-badge">Loading</span> : null}
-          </div>
-          <div className="dashboard-actions">
-            <article className="action-card">
-              <span>Latest applied</span>
-              <strong>{latestAppliedJob ? latestAppliedJob.company : "No applied jobs yet"}</strong>
-              <p>
-                {latestAppliedJob
-                  ? latestAppliedJob.title
-                  : "Move a saved job to applied once you send the application."}
-              </p>
-              {latestAppliedJob ? (
-                <NavLink className="inline-link" to={`/jobs/${latestAppliedJob.id}`}>
-                  Open workspace
-                </NavLink>
-              ) : null}
-            </article>
-            <article className="action-card">
-              <span>Latest saved</span>
-              <strong>{latestSavedJob ? latestSavedJob.company : "No saved jobs yet"}</strong>
-              <p>
-                {latestSavedJob
-                  ? latestSavedJob.title
-                  : "Add a role to start building your pipeline."}
-              </p>
-              {latestSavedJob ? (
-                <NavLink className="inline-link" to={`/jobs/${latestSavedJob.id}`}>
-                  Review job
-                </NavLink>
-              ) : null}
-            </article>
+            <div className="two-column-grid">
+              <label>
+                Salary expectation
+                <input
+                  onChange={(event) => updateProfile("salary_expectation", event.target.value)}
+                  placeholder="€2,500+ net"
+                  value={profileDraft.salary_expectation}
+                />
+              </label>
+              <label className="checkbox-field">
+                Open to relocate
+                <input
+                  checked={profileDraft.open_to_relocate}
+                  onChange={(event) => updateProfile("open_to_relocate", event.target.checked)}
+                  type="checkbox"
+                />
+              </label>
+            </div>
           </div>
         </article>
 
         <article className="panel">
           <div className="panel-header">
             <div>
-              <p className="eyebrow">Stage 3 outcome</p>
-              <h2>Dedicated workspace per job</h2>
+              <p className="eyebrow">Experience and stack</p>
+              <h2>What the model should weight most</h2>
             </div>
           </div>
-          <ul className="feature-list">
-            <li>Each job now has its own scoped chat history</li>
-            <li>Structured metadata lives next to the conversation</li>
-            <li>Natural language updates recruiter, dates, and notes</li>
-            <li>This is the foundation for a real agent-like assistant</li>
-          </ul>
+          <div className="job-form">
+            <div className="two-column-grid">
+              <label>
+                Years of experience
+                <input
+                  min="0"
+                  onChange={(event) =>
+                    updateProfile("years_of_experience", Number(event.target.value) || 0)
+                  }
+                  type="number"
+                  value={profileDraft.years_of_experience}
+                />
+              </label>
+              <label>
+                English level
+                <input
+                  onChange={(event) => updateProfile("english_level", event.target.value)}
+                  placeholder="B2"
+                  value={profileDraft.english_level}
+                />
+              </label>
+            </div>
+            <label>
+              Tech stack
+              <input
+                onChange={(event) =>
+                  updateProfile("tech_stack", parseCommaSeparatedList(event.target.value))
+                }
+                placeholder="React, TypeScript, FastAPI, PostgreSQL"
+                value={profileDraft.tech_stack.join(", ")}
+              />
+            </label>
+            <label>
+              Skills
+              <textarea
+                onChange={(event) =>
+                  updateProfile(
+                    "skills",
+                    parseCommaSeparatedList(event.target.value).map((name) => {
+                      const existing = profileDraft.skills.find(
+                        (skill) => normalizeToken(skill.name) === normalizeToken(name)
+                      );
+                      return existing ?? { name, level: "intermediate", years: 1 };
+                    })
+                  )
+                }
+                placeholder="React, TypeScript, Product Thinking, Python, APIs"
+                rows={5}
+                value={serializeSkills(profileDraft.skills)}
+              />
+            </label>
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Links and proof</p>
+              <h2>Signals recruiters can verify</h2>
+            </div>
+          </div>
+          <div className="job-form">
+            <label>
+              GitHub URL
+              <input
+                onChange={(event) => updateProfile("github_url", event.target.value)}
+                placeholder="https://github.com/yourname"
+                type="url"
+                value={profileDraft.github_url}
+              />
+            </label>
+            <label>
+              Portfolio URL
+              <input
+                onChange={(event) => updateProfile("portfolio_url", event.target.value)}
+                placeholder="https://yourportfolio.dev"
+                type="url"
+                value={profileDraft.portfolio_url}
+              />
+            </label>
+          </div>
         </article>
       </section>
     </>
+  );
+}
+
+function CreateJobModal({
+  formState,
+  importBusy,
+  isDemoMode,
+  jobError,
+  jobFormMessage,
+  onClose,
+  onCreateJob,
+  onImportJob,
+  setFormState,
+  visible
+}: CreateJobModalProps) {
+  if (!visible) {
+    return null;
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose} role="presentation">
+      <section className="modal-card panel" onClick={(event) => event.stopPropagation()}>
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">New role</p>
+            <h2>Create or import a job workspace</h2>
+          </div>
+          <button className="ghost-button" onClick={onClose} type="button">
+            Close
+          </button>
+        </div>
+        {isDemoMode ? (
+          <p className="mode-note">
+            Demo mode uses sample data. Sign in normally to test real AI job import.
+          </p>
+        ) : null}
+        <form className="job-form" onSubmit={onCreateJob}>
+          <label>
+            Company
+            <input
+              onChange={(event) =>
+                setFormState((current) => ({ ...current, company: event.target.value }))
+              }
+              placeholder="Stripe"
+              required
+              value={formState.company}
+            />
+          </label>
+          <label>
+            Position title
+            <input
+              onChange={(event) =>
+                setFormState((current) => ({ ...current, title: event.target.value }))
+              }
+              placeholder="Frontend Engineer"
+              required
+              value={formState.title}
+            />
+          </label>
+          <label>
+            Job link
+            <input
+              onChange={(event) =>
+                setFormState((current) => ({ ...current, link: event.target.value }))
+              }
+              placeholder="https://company.com/jobs/123"
+              required
+              type="url"
+              value={formState.link}
+            />
+          </label>
+          <label>
+            Job description or notes
+            <textarea
+              onChange={(event) =>
+                setFormState((current) => ({ ...current, notes: event.target.value }))
+              }
+              placeholder="Paste requirements, recruiter context, or why the role matters..."
+              rows={6}
+              value={formState.notes}
+            />
+          </label>
+          {jobError ? <p className="error-text">{jobError}</p> : null}
+          {jobFormMessage ? <p className="success-text">{jobFormMessage}</p> : null}
+          <div className="job-form-actions">
+            <button className="primary-button" type="submit">
+              Save job
+            </button>
+            <button
+              className="secondary-button"
+              disabled={importBusy || isDemoMode}
+              onClick={() => void onImportJob()}
+              type="button"
+            >
+              {isDemoMode ? "Live import unavailable in demo" : importBusy ? "Importing..." : "Import from link"}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -1559,8 +2193,10 @@ function JobPage({
   const jobId = Number(params.jobId);
   const job = jobs.find((item) => item.id === jobId) ?? null;
   const [chatInput, setChatInput] = useState("");
+  const [chatAttachments, setChatAttachments] = useState<ChatAttachment[]>([]);
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const [editState, setEditState] = useState<JobEditableFields>({
     company: "",
     title: "",
@@ -1621,8 +2257,12 @@ function JobPage({
 
   async function submitChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await onSendMessage(currentJob, chatInput);
+    await onSendMessage(currentJob, chatInput, chatAttachments);
     setChatInput("");
+    setChatAttachments([]);
+    if (attachmentInputRef.current) {
+      attachmentInputRef.current.value = "";
+    }
   }
 
   async function handleChatKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -1630,11 +2270,49 @@ function JobPage({
       return;
     }
     event.preventDefault();
-    if (!chatInput.trim() || isMessagingCurrentJob) {
+    if ((!chatInput.trim() && !chatAttachments.length) || isMessagingCurrentJob) {
       return;
     }
-    await onSendMessage(currentJob, chatInput);
+    await onSendMessage(currentJob, chatInput, chatAttachments);
     setChatInput("");
+    setChatAttachments([]);
+    if (attachmentInputRef.current) {
+      attachmentInputRef.current.value = "";
+    }
+  }
+
+  async function handleAttachmentChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    if (!files.length) {
+      return;
+    }
+
+    const supportedFiles = files.filter(isSupportedAttachment);
+    const unsupportedCount = files.length - supportedFiles.length;
+    const oversizedFiles = supportedFiles.filter((file) => file.size > MAX_ATTACHMENT_SIZE_BYTES);
+    const validFiles = supportedFiles.filter((file) => file.size <= MAX_ATTACHMENT_SIZE_BYTES);
+
+    try {
+      const nextAttachments = await Promise.all(
+        validFiles.slice(0, MAX_CHAT_ATTACHMENTS).map((file) => fileToAttachment(file))
+      );
+      setChatAttachments(nextAttachments);
+      if (unsupportedCount > 0) {
+        alert("Only images and PDF files are supported in chat attachments.");
+      }
+      if (oversizedFiles.length > 0) {
+        alert("Each attachment must be 5 MB or smaller.");
+      }
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Could not attach the selected file.");
+    }
+  }
+
+  function removeAttachment(fileName: string) {
+    setChatAttachments((current) => current.filter((item) => item.file_name !== fileName));
+    if (attachmentInputRef.current && chatAttachments.length <= 1) {
+      attachmentInputRef.current.value = "";
+    }
   }
 
   return (
@@ -1685,7 +2363,16 @@ function JobPage({
                   <strong>{message.role === "assistant" ? "Assistant" : "You"}</strong>
                   <span>{new Date(message.created_at).toLocaleString()}</span>
                 </div>
-                <p>{message.content}</p>
+                <div className="message-body">{renderFormattedMessage(message.content)}</div>
+                {message.attachment_names?.length ? (
+                  <div className="attachment-chip-row">
+                    {message.attachment_names.map((attachmentName) => (
+                      <span key={attachmentName} className="attachment-chip">
+                        {attachmentName}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
               </article>
             ))}
           </div>
@@ -1704,21 +2391,56 @@ function JobPage({
           </div>
 
           <form className="chat-form" onSubmit={submitChat}>
+            <input
+              ref={attachmentInputRef}
+              accept="image/*,.pdf,application/pdf"
+              className="sr-only"
+              onChange={(event) => void handleAttachmentChange(event)}
+              type="file"
+              multiple
+            />
             <textarea
               onChange={(event) => setChatInput(event.target.value)}
               onKeyDown={(event) => void handleChatKeyDown(event)}
-              placeholder="Try: I applied today, Recruiter is Anna Smith, Follow up in 3 days..."
+              placeholder="Ask about the role, or attach a screenshot / PDF if the job page is missing details..."
               rows={4}
               value={chatInput}
             />
+            {chatAttachments.length ? (
+              <div className="attachment-chip-row pending">
+                {chatAttachments.map((attachment) => (
+                  <button
+                    key={attachment.file_name}
+                    className="attachment-chip removable"
+                    onClick={() => removeAttachment(attachment.file_name)}
+                    type="button"
+                  >
+                    {attachment.file_name} ×
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <div className="chat-form-footer">
               <p className="muted-text">
-                Enter to send. Shift+Enter for a new line. This assistant is scoped only to{" "}
-                {currentJob.company} and its workspace data.
+                Enter to send. Shift+Enter for a new line. You can also attach screenshots or PDFs for this job.
               </p>
-              <button className="primary-button" disabled={isMessagingCurrentJob} type="submit">
+              <div className="chat-actions">
+                <button
+                  className="secondary-button"
+                  disabled={isDemoMode}
+                  onClick={() => attachmentInputRef.current?.click()}
+                  type="button"
+                >
+                  {isDemoMode ? "Attachments unavailable in demo" : "Attach image or PDF"}
+                </button>
+                <button
+                  className="primary-button"
+                  disabled={isMessagingCurrentJob || (!chatInput.trim() && !chatAttachments.length)}
+                  type="submit"
+                >
                 {isMessagingCurrentJob ? "Updating..." : "Send message"}
-              </button>
+                </button>
+              </div>
             </div>
           </form>
         </article>

@@ -12,6 +12,7 @@ from app.models.job import JobStatus
 from app.schemas.ai import (
     AnalyzeJobRequest,
     AnalyzeJobResponse,
+    ChatAttachmentPayload,
     ChatJobRequest,
     ChatJobResponse,
     JobAnalysisPayload,
@@ -19,6 +20,9 @@ from app.schemas.ai import (
     JobMetadataPayload,
     ParseJobRequest,
     ParseJobResponse,
+    ProfileImportRequest,
+    ProfileImportResponse,
+    UserProfilePayload,
     WorkspacePatchPayload,
 )
 
@@ -133,6 +137,22 @@ def _infer_requirements(text: str) -> list[str]:
 
 def _collect_profile_terms(profile: UserProfilePayload) -> set[str]:
     terms: set[str] = set()
+    for value in [
+        profile.headline,
+        profile.summary,
+        profile.english_level,
+        profile.location,
+        profile.target_seniority,
+        profile.work_format,
+        profile.github_url,
+        profile.portfolio_url,
+        *profile.preferred_roles,
+        *profile.preferred_locations,
+    ]:
+        normalized_value = _normalize_token(value)
+        if normalized_value:
+            terms.add(normalized_value)
+
     for skill in profile.skills:
         terms.add(_normalize_token(skill.name))
         for canonical, aliases in REQUIREMENT_ALIASES.items():
@@ -150,6 +170,70 @@ def _collect_profile_terms(profile: UserProfilePayload) -> set[str]:
     return {term for term in terms if term}
 
 
+def _english_level_rank(value: str) -> int:
+    normalized = _normalize_token(value)
+    mapping = {
+        "a1": 1,
+        "a2": 2,
+        "b1": 3,
+        "b1/b2": 4,
+        "b2": 5,
+        "c1": 6,
+        "c2": 7,
+        "upper-intermediate": 5,
+        "intermediate": 3,
+        "advanced": 6,
+        "fluent": 7,
+    }
+    return mapping.get(normalized, 0)
+
+
+def _requirement_labels(requirement: str) -> list[str]:
+    normalized = _normalize_token(requirement)
+    labels: list[str] = []
+
+    for canonical, aliases in REQUIREMENT_ALIASES.items():
+        candidate_terms = {canonical_normalized for canonical_normalized in [_normalize_token(canonical)]}
+        candidate_terms.update(aliases)
+        if any(term in normalized for term in candidate_terms):
+            if canonical not in labels:
+                labels.append(canonical)
+
+    if re.search(r"\breact\b", normalized) and "React" not in labels:
+        labels.append("React")
+    if re.search(r"\btypescript\b|\bts\b", normalized) and "TypeScript" not in labels:
+        labels.append("TypeScript")
+    if re.search(r"\bredux\b|\brxjs\b", normalized):
+        labels.append("Modern frontend architecture")
+    if re.search(r"\bresponsive\b|\bperformance\b|\bweb development principles\b", normalized):
+        labels.append("Frontend Architecture")
+    if re.search(r"\bmui\b|\bstyled-components\b|\bdesign systems?\b|\bui component libraries?\b", normalized):
+        labels.append("Design systems")
+    if re.search(r"\bgit\b", normalized):
+        labels.append("Git")
+    if re.search(r"\bagile\b", normalized):
+        labels.append("Agile collaboration")
+    if re.search(r"\benglish\b|\bb2\b|upper-intermediate", normalized):
+        labels.append("B2 English")
+    if re.search(r"\bremote\b|\bhybrid\b|\bonsite\b", normalized):
+        labels.append("Work format")
+    if re.search(r"(\d+)\+?\s+years?", normalized):
+        labels.append("Years of experience")
+
+    deduped: list[str] = []
+    for label in labels:
+        if label not in deduped:
+            deduped.append(label)
+
+    if deduped:
+        return deduped
+
+    compact = requirement.strip()
+    if len(compact) > 88:
+        compact = compact[:85].rstrip(" ,.;:") + "..."
+    return [compact]
+
+
 def _canonicalize_requirement(requirement: str) -> str:
     normalized = _normalize_token(requirement)
     for canonical, aliases in REQUIREMENT_ALIASES.items():
@@ -158,7 +242,7 @@ def _canonicalize_requirement(requirement: str) -> str:
     return requirement.strip()
 
 
-def _requirement_match_kind(requirement: str, profile_terms: set[str]) -> str:
+def _requirement_match_kind(requirement: str, profile_terms: set[str], profile: UserProfilePayload) -> str:
     normalized = _normalize_token(requirement)
     canonical = _canonicalize_requirement(requirement)
     canonical_normalized = _normalize_token(canonical)
@@ -168,6 +252,23 @@ def _requirement_match_kind(requirement: str, profile_terms: set[str]) -> str:
         return "direct"
     if aliases & profile_terms:
         return "direct"
+    if any(alias in normalized for alias in aliases):
+        return "direct"
+    if canonical == "Years of experience":
+        years_match = re.search(r"(\d+)\+?\s+years?", normalized)
+        if years_match and profile.years_of_experience >= int(years_match.group(1)):
+            return "direct"
+    if canonical == "B2 English":
+        required_rank = 5 if "b2" in normalized or "upper-intermediate" in normalized else 3
+        if _english_level_rank(profile.english_level) >= required_rank:
+            return "direct"
+    if canonical == "Work format":
+        if "remote" in normalized and profile.work_format == "remote":
+            return "direct"
+        if "hybrid" in normalized and profile.work_format in {"hybrid", "remote"}:
+            return "transferable"
+        if "onsite" in normalized and profile.work_format == "office":
+            return "direct"
     if canonical == "API" and any(term in profile_terms for term in {"fastapi", "rest", "rest api", "graphql"}):
         return "transferable"
     if canonical == "Communication":
@@ -176,6 +277,16 @@ def _requirement_match_kind(requirement: str, profile_terms: set[str]) -> str:
         return "soft"
     if canonical == "Cloud" and any(term in profile_terms for term in {"docker", "postgresql", "supabase"}):
         return "transferable"
+    if canonical == "Modern frontend architecture" and any(
+        term in profile_terms for term in {"react", "typescript", "javascript", "frontend engineer", "frontend architecture"}
+    ):
+        return "transferable"
+    if canonical == "Design systems" and any(
+        term in profile_terms for term in {"react", "frontend architecture", "ux"}
+    ):
+        return "transferable"
+    if canonical == "Git" and "git" in profile_terms:
+        return "direct"
     return "missing"
 
 
@@ -207,11 +318,16 @@ def _analysis_summary(
     transferable_matches: list[str],
     missing: list[str],
 ) -> str:
+    generic_labels = {"Years of experience", "B2 English", "Work format"}
+    top_direct = [label for label in _prioritize_match_labels(direct_matches) if label not in generic_labels]
+    if not top_direct:
+        top_direct = _prioritize_match_labels(direct_matches)
+
     if recommendation == "apply":
         if direct_matches:
             return (
-                f"Strong fit overall. Your best overlap is in {', '.join(direct_matches[:2])}, "
-                f"and the role looks {seniority_fit} for your current profile."
+                f"Strong fit overall. Your best overlap is in {', '.join(top_direct[:2])}, "
+                f"and the role looks like a {seniority_fit} role for your current profile."
             )
         return "Strong overall fit with enough relevant overlap to justify applying."
 
@@ -242,6 +358,24 @@ def _job_requirements_preview(workspace: AnalyzeJobRequest | ChatJobRequest | ob
         f"{getattr(candidate, 'title', '')} {getattr(candidate, 'job_description', '')} {getattr(candidate, 'notes', '')}"
     )
     return [_canonicalize_requirement(item) for item in requirements][:8]
+
+
+def _prioritize_match_labels(labels: list[str]) -> list[str]:
+    priority_map = {
+        "React": 1,
+        "TypeScript": 1,
+        "JavaScript": 1,
+        "Node.js": 1,
+        "Frontend Architecture": 2,
+        "API": 2,
+        "Git": 2,
+        "Design systems": 3,
+        "Modern frontend architecture": 3,
+        "Years of experience": 4,
+        "B2 English": 5,
+        "Work format": 6,
+    }
+    return sorted(labels, key=lambda label: (priority_map.get(label, 3), label.lower()))
 
 
 def _job_summary_text(workspace: AnalyzeJobRequest | ChatJobRequest | object) -> str:
@@ -625,6 +759,35 @@ def _should_use_deterministic_chat(message: str) -> bool:
     return any(re.search(pattern, lower) for pattern in deterministic_patterns)
 
 
+def _attachment_summary(attachments: list[ChatAttachmentPayload]) -> list[str]:
+    return [attachment.file_name for attachment in attachments]
+
+
+def _anthropic_attachment_block(attachment: ChatAttachmentPayload) -> dict | None:
+    media_type = attachment.media_type.lower()
+    if media_type.startswith("image/"):
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": attachment.data_base64,
+            },
+        }
+
+    if media_type == "application/pdf":
+        return {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": attachment.data_base64,
+            },
+        }
+
+    return None
+
+
 def _looks_like_company_or_search_page(job_url: str) -> bool:
     parsed_url = parse.urlparse(job_url)
     path = parsed_url.path.lower()
@@ -877,42 +1040,64 @@ def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
     missing: list[str] = []
 
     for requirement in requirements:
-        canonical = _canonicalize_requirement(requirement)
-        match_kind = _requirement_match_kind(canonical, profile_terms)
-        if match_kind == "direct":
-            if canonical not in direct_matches:
-                direct_matches.append(canonical)
-        elif match_kind == "transferable":
-            if canonical not in transferable_matches:
-                transferable_matches.append(canonical)
-        elif match_kind == "soft":
-            if canonical not in soft_matches:
-                soft_matches.append(canonical)
+        labels = _requirement_labels(requirement)
+        best_match_kind = "missing"
+        matched_labels: list[str] = []
+        for label in labels:
+            match_kind = _requirement_match_kind(label, profile_terms, profile)
+            if match_kind == "direct":
+                best_match_kind = "direct"
+                matched_labels.append(label)
+            elif match_kind == "transferable" and best_match_kind != "direct":
+                best_match_kind = "transferable"
+                matched_labels.append(label)
+            elif match_kind == "soft" and best_match_kind not in {"direct", "transferable"}:
+                best_match_kind = "soft"
+                matched_labels.append(label)
+
+        target_labels = matched_labels or labels[:1]
+        if best_match_kind == "direct":
+            for label in target_labels:
+                if label not in direct_matches:
+                    direct_matches.append(label)
+        elif best_match_kind == "transferable":
+            for label in target_labels:
+                if label not in transferable_matches:
+                    transferable_matches.append(label)
+        elif best_match_kind == "soft":
+            for label in target_labels:
+                if label not in soft_matches:
+                    soft_matches.append(label)
         else:
-            if canonical not in missing:
-                missing.append(canonical)
+            for label in target_labels:
+                if label not in missing:
+                    missing.append(label)
 
     profile_role_families = _profile_role_families(profile)
     workspace_family = _workspace_role_family(workspace)
     strong_role_fit = workspace_family in profile_role_families if workspace_family else False
-
-    score = 34
-    score += len(direct_matches) * 13
-    score += len(transferable_matches) * 7
-    score += len(soft_matches) * 2
-    score += min(profile.years_of_experience * 3, 12)
-    if strong_role_fit:
-        score += 10
-    if workspace_family == "full-stack" and profile_role_families & {"frontend", "backend"}:
-        score += 5
-    score -= min(len(missing) * 5, 25)
-    score = max(25, min(96, score))
 
     seniority_fit = "good fit"
     if profile.years_of_experience <= 1 and re.search(r"senior|lead", workspace.title, re.I):
         seniority_fit = "too junior"
     elif profile.years_of_experience >= 6 and re.search(r"junior|intern", workspace.title, re.I):
         seniority_fit = "too senior"
+
+    score = 30
+    score += len(direct_matches) * 15
+    score += len(transferable_matches) * 8
+    score += len(soft_matches) * 3
+    score += min(profile.years_of_experience * 3, 12)
+    if strong_role_fit:
+        score += 10
+    if workspace_family == "full-stack" and profile_role_families & {"frontend", "backend"}:
+        score += 5
+    if seniority_fit == "good fit":
+        score += 4
+    score -= min(len(missing) * 4, 20)
+    score = max(32, min(90, score))
+
+    prioritized_strengths = _prioritize_match_labels(direct_matches + transferable_matches + soft_matches)
 
     recommendation = "skip"
     if seniority_fit == "too junior":
@@ -924,7 +1109,7 @@ def analyze_job_fallback(payload: AnalyzeJobRequest) -> AnalyzeJobResponse:
 
     analysis = JobAnalysisPayload(
         match_score=score,
-        strengths=(direct_matches + transferable_matches + soft_matches)[:4]
+        strengths=prioritized_strengths[:4]
         or ["Transferable engineering foundation"],
         missing_skills=missing or ["No obvious critical gaps"],
         seniority_fit=seniority_fit,
@@ -1136,7 +1321,7 @@ def chat_job_fallback(payload: ChatJobRequest) -> ChatJobResponse:
     )
 
 
-def _anthropic_request(system_prompt: str, user_prompt: str) -> str | None:
+def _anthropic_request(system_prompt: str, user_prompt: str | list[dict]) -> str | None:
     if not settings.anthropic_api_key:
         return None
 
@@ -1178,6 +1363,97 @@ def _anthropic_request(system_prompt: str, user_prompt: str) -> str | None:
         if text:
             return text
     return None
+
+
+def profile_import_with_optional_llm(payload: ProfileImportRequest) -> ProfileImportResponse:
+    fallback_profile = payload.profile.model_copy(deep=True)
+    if payload.github_url and not fallback_profile.github_url:
+        fallback_profile.github_url = str(payload.github_url)
+
+    github_text = ""
+    if payload.github_url:
+        raw_html, _ = _fetch_url_content(str(payload.github_url))
+        github_text = _strip_html(raw_html)[:12000] if raw_html else ""
+
+    attachment_blocks = [
+        block
+        for attachment in payload.attachments
+        if (block := _anthropic_attachment_block(attachment)) is not None
+    ]
+    attachment_names = ", ".join(_attachment_summary(payload.attachments)) or "none"
+    user_content: str | list[dict]
+    if attachment_blocks:
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    "Current candidate profile JSON:\n"
+                    f"{json.dumps(payload.profile.model_dump(mode='json'), ensure_ascii=False)}\n\n"
+                    f"GitHub URL: {payload.github_url or 'not provided'}\n"
+                    f"GitHub page text:\n{github_text or 'No GitHub page text available.'}\n\n"
+                    f"Attached CV / screenshots: {attachment_names}\n"
+                    "Use the attachments and GitHub page to enrich the candidate profile."
+                ),
+            },
+            *attachment_blocks,
+        ]
+    else:
+        user_content = (
+            "Current candidate profile JSON:\n"
+            f"{json.dumps(payload.profile.model_dump(mode='json'), ensure_ascii=False)}\n\n"
+            f"GitHub URL: {payload.github_url or 'not provided'}\n"
+            f"GitHub page text:\n{github_text or 'No GitHub page text available.'}\n"
+        )
+
+    response_text = _anthropic_request(
+        system_prompt=(
+            "You extract and enrich one candidate profile from a CV, screenshots, and optionally a GitHub page. "
+            "Return valid JSON only with keys profile and summary. "
+            "profile must include headline, summary, preferred_roles, target_seniority, tech_stack, skills, "
+            "years_of_experience, english_level, location, preferred_locations, work_format, open_to_relocate, "
+            "salary_expectation, github_url, portfolio_url. "
+            "skills must be an array of objects with name, level, years. "
+            "Only include facts supported by the attachments, GitHub page, or the current profile. "
+            "Do not invent employers, salaries, locations, or experience. "
+            "If a field is unknown, preserve the current value or leave it empty. "
+            "Keep the profile summary concise and recruiter-friendly."
+        ),
+        user_prompt=user_content,
+    )
+    if not response_text:
+        return ProfileImportResponse(
+            profile=fallback_profile,
+            summary="AI could not enrich the profile right now. Your existing profile draft is still available.",
+            provider_mode="fallback",
+        )
+
+    parsed = _extract_json_payload(response_text)
+    if not parsed:
+        return ProfileImportResponse(
+            profile=fallback_profile,
+            summary="AI returned an unreadable profile payload, so the existing draft was preserved.",
+            provider_mode="fallback",
+        )
+
+    try:
+        profile_payload = parsed.get("profile") or {}
+        merged_profile = fallback_profile.model_dump(mode="json")
+        merged_profile.update({key: value for key, value in profile_payload.items() if value is not None})
+        if payload.github_url and not merged_profile.get("github_url"):
+            merged_profile["github_url"] = str(payload.github_url)
+        profile = UserProfilePayload(**merged_profile)
+    except (TypeError, ValueError):
+        return ProfileImportResponse(
+            profile=fallback_profile,
+            summary="AI enrichment failed validation, so the existing profile draft was preserved.",
+            provider_mode="fallback",
+        )
+
+    return ProfileImportResponse(
+        profile=profile,
+        summary=parsed.get("summary") or "AI enriched the profile draft. Review the fields and save any changes you want to keep.",
+        provider_mode="llm",
+    )
 
 
 def parse_job_with_optional_llm(payload: ParseJobRequest) -> ParseJobResponse:
@@ -1243,6 +1519,10 @@ def analyze_job_with_optional_llm(payload: AnalyzeJobRequest) -> AnalyzeJobRespo
             "match_score, strengths, missing_skills, seniority_fit, recommendation, summary. "
             "Be nuanced, not overly harsh. Score based on core must-have overlap, seniority, years of experience, "
             "and transferable skills. Do not penalize every missing keyword equally. "
+            "Do not list requirements as missing if the candidate already clearly meets them through skills, years of experience, "
+            "English level, work format, or equivalent stack. "
+            "missing_skills must be short phrases only, never long copied requirement bullets or full sentences. "
+            "strengths must also be short phrases, max 5 items. "
             "If the job data is incomplete, blocked, or clearly from a search/careers page, say that directly in the summary, "
             "keep the score conservative, and do not hallucinate missing requirements. "
             "Keep strengths and missing_skills concrete and short. Keep summary to one or two sentences."
@@ -1269,8 +1549,30 @@ def analyze_job_with_optional_llm(payload: AnalyzeJobRequest) -> AnalyzeJobRespo
 
 def chat_job_with_optional_llm(payload: ChatJobRequest) -> ChatJobResponse:
     fallback = chat_job_fallback(payload)
-    if _should_use_deterministic_chat(payload.message):
+    if _should_use_deterministic_chat(payload.message) and not payload.attachments:
         return fallback
+    attachment_blocks = [
+        block
+        for attachment in payload.attachments
+        if (block := _anthropic_attachment_block(attachment)) is not None
+    ]
+    user_content: str | list[dict]
+    if attachment_blocks:
+        attachment_names = ", ".join(_attachment_summary(payload.attachments))
+        workspace_payload = payload.model_dump(mode="json", exclude={"attachments"})
+        user_content = [
+            {
+                "type": "text",
+                "text": (
+                    f"User message: {payload.message}\n"
+                    f"Attachments: {attachment_names}\n"
+                    f"Workspace context JSON:\n{json.dumps(workspace_payload, ensure_ascii=False)}"
+                ),
+            },
+            *attachment_blocks,
+        ]
+    else:
+        user_content = json.dumps(payload.model_dump(mode="json"), ensure_ascii=False)
     response_text = _anthropic_request(
         system_prompt=(
             "You are a job-specific assistant for one job workspace. "
@@ -1279,6 +1581,7 @@ def chat_job_with_optional_llm(payload: ChatJobRequest) -> ChatJobResponse:
             "Avoid markdown headings, tables, bold formatting, and emoji unless the user asks. "
             "When the user asks about requirements, skills, fit, or next steps, answer directly from the workspace data. "
             "You should also be useful for questions like whether to apply, how to summarize the role, and what to ask the recruiter. "
+            "If the user attached screenshots or PDFs, inspect them and use them to recover missing job details when possible. "
             "If the user also updates structured data like recruiter, application date, follow-up date, notes, or status, "
             "put recruiter/contact, source, dates, and summary fields into metadata_patch. "
             "Put company, title, job_description, and extracted_requirements corrections into workspace_patch. "
@@ -1286,9 +1589,18 @@ def chat_job_with_optional_llm(payload: ChatJobRequest) -> ChatJobResponse:
             "return valid JSON only with keys assistant_message, metadata_patch, workspace_patch, notes_append, status_patch. "
             "If the user is only asking a normal question, return a plain natural-language answer and do not force JSON."
         ),
-        user_prompt=json.dumps(payload.model_dump(mode="json"), ensure_ascii=False),
+        user_prompt=user_content,
     )
     if not response_text:
+        if payload.attachments:
+            attachment_names = ", ".join(_attachment_summary(payload.attachments))
+            return ChatJobResponse(
+                assistant_message=_message(
+                    "assistant",
+                    f"I couldn't inspect the attached file(s) right now: {attachment_names}. Try again in live AI mode, or paste the most important text from the file here.",
+                ),
+                provider_mode="fallback",
+            )
         return fallback
 
     parsed = _extract_json_payload(response_text)
