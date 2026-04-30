@@ -152,6 +152,12 @@ npm run dev
 
 Frontend runs on `http://localhost:5173`
 
+Example frontend env file:
+
+```env
+VITE_API_BASE_URL=http://localhost:8000/api
+```
+
 ## Environment variables
 
 Example backend env file:
@@ -198,6 +204,7 @@ Before deploy:
 - set a production `JWT_SECRET`
 - set the final frontend origin in `CORS_ORIGINS`
 - switch `DATABASE_URL` to the production database
+- set `VITE_API_BASE_URL` in Vercel to your Render backend URL, for example `https://your-backend.onrender.com/api`
 
 ## Portfolio positioning
 

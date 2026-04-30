@@ -7,7 +7,19 @@ import type {
   UserProfile
 } from "../types";
 
-const API_BASE_URL = "http://localhost:8000/api";
+function resolveApiBaseUrl(): string {
+  const configured = import.meta.env.VITE_API_BASE_URL?.trim();
+
+  if (!configured) {
+    return "http://localhost:8000/api";
+  }
+
+  return configured.endsWith("/api")
+    ? configured.replace(/\/+$/, "")
+    : `${configured.replace(/\/+$/, "")}/api`;
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 type RequestOptions = {
   method?: string;
